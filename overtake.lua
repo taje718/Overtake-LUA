@@ -26,9 +26,16 @@ local CFG = {
   MAX_CRASHES        = 2,     -- the run ends on this crash (1st crash only resets the combo)
   CRASH_COOLDOWN_S   = 2.0,   -- ignore further contact this long after a crash (one scrape = one crash)
   CRASH_SCORE_LOSS   = 0.0,   -- fraction of round score lost on a non-final crash (0 = none, 0.5 = half)
-  -- Leave empty to treat every other car as traffic. Otherwise list
-  -- substrings of the car folder names used for your traffic cars.
-  TRAFFIC_MODELS     = {},
+  PIT_RESET_SAVES_BEST = true, -- true: score is banked toward your best when you return to pits. false: score is thrown away
+  TELEPORT_DIST      = 200,   -- a jump bigger than this (m) in one frame counts as a teleport to pits
+  -- Discord leaderboard (see worker.js). Leave LEADERBOARD_URL empty to turn it off.
+  LEADERBOARD_URL    = '',    -- your Cloudflare Worker URL
+  LEADERBOARD_KEY    = '',    -- same value as SUBMIT_KEY in the Worker
+  MIN_SUBMIT_SCORE   = 1000,  -- runs scoring less than this are not sent
+  -- Only cars whose folder name contains one of these words count as traffic.
+  -- "traffic" matches traffic_* and nohesi_traffic_* cars. Other players
+  -- are not counted. Leave the list empty to count every other car.
+  TRAFFIC_MODELS     = { "traffic", "mtn_victoria" },
 }
 
 ---------------------------------------------------------------------
@@ -81,12 +88,32 @@ local function startRound()
   S.crashes, S.crashCooldown = 0, 0
 end
 
+local function jsonStr(s)
+  return (tostring(s or ''):gsub('%c', ' '):gsub('\\', '\\\\'):gsub('"', '\\"'))
+end
+
+-- sends the finished run to the leaderboard relay (if configured)
+local function submitScore(score)
+  if CFG.LEADERBOARD_URL == '' or score < CFG.MIN_SUBMIT_SCORE then return end
+  local name = ac.getDriverName(0) or 'Unknown'
+  local body = string.format('{"name":"%s","score":%d,"key":"%s"}',
+    jsonStr(name), score, jsonStr(CFG.LEADERBOARD_KEY))
+  local ok, e = pcall(function()
+    web.post(CFG.LEADERBOARD_URL, { ['Content-Type'] = 'application/json' }, body,
+      function(err, response)
+        if err then ac.log('leaderboard error: ' .. tostring(err)) end
+      end)
+  end)
+  if not ok then ac.log('leaderboard failed: ' .. tostring(e)) end
+end
+
 local function endRound(reason)
   S.endReason = reason or 'TIME UP'
   S.phase = 'finished'
   S.finishTimer = CFG.RESULT_SHOW_S
   S.combo, S.mult, S.comboTimer = 0, 1.0, 0
   local final = math.floor(S.score)
+  submitScore(final)
   if final > storage.bestScore then
     storage.bestScore = final
     S.newBest = true
@@ -119,6 +146,7 @@ end
 -- UPDATE
 ---------------------------------------------------------------------
 local wasColliding = false
+local lastPos = nil
 
 function script.update(dt)
   local player = ac.getCar(0)
@@ -137,6 +165,24 @@ function script.update(dt)
       S.timeLeft = CFG.ROUND_TIME_S
       S.score = 0
     end
+  end
+
+  -- returning to the pits (or teleporting there) resets the run
+  local inPit = player.isInPit or player.isInPitlane
+  local teleported = lastPos ~= nil and player.position:distance(lastPos) > CFG.TELEPORT_DIST
+  lastPos = player.position:clone()
+  if S.phase == 'running' and (inPit or teleported) then
+    if CFG.PIT_RESET_SAVES_BEST then
+      endRound('BACK TO PITS')
+    else
+      S.phase = 'idle'
+      S.timeLeft = CFG.ROUND_TIME_S
+      S.score, S.combo, S.mult, S.comboTimer = 0, 0, 1.0, 0
+      S.crashes, S.crashCooldown = 0, 0
+    end
+    S.prevForward = {}
+  elseif teleported then
+    S.prevForward = {}
   end
 
   -- crash: 1st resets the combo, reaching MAX_CRASHES ends the run
@@ -193,52 +239,118 @@ end
 ---------------------------------------------------------------------
 -- UI
 ---------------------------------------------------------------------
+local function lerp(a, b, t) return a + (b - a) * t end
+
+-- multiplier colour: ice blue -> yellow -> red as the multiplier climbs
+local function multRGB(m)
+  local t = math.saturate((m - 1) / (CFG.MULT_MAX - 1))
+  if t < 0.5 then
+    local k = t / 0.5
+    return lerp(0.55, 1.0, k), lerp(0.85, 0.85, k), lerp(1.0, 0.2, k)
+  else
+    local k = (t - 0.5) / 0.5
+    return 1.0, lerp(0.85, 0.3, k), lerp(0.2, 0.15, k)
+  end
+end
+
+local function textCenter(text, size, cx, y, col)
+  local w = ui.measureDWriteText(text, size).x
+  ui.dwriteDrawText(text, size, vec2(cx - w / 2, y), col)
+end
+
+local function textRight(text, size, rx, y, col)
+  local w = ui.measureDWriteText(text, size).x
+  ui.dwriteDrawText(text, size, vec2(rx - w, y), col)
+end
+
+local GREY = rgbm(0.65, 0.7, 0.78, 1)
+local WHITE = rgbm(1, 1, 1, 1)
+
 function script.drawUI()
   local uiState = ac.getUI()
-  local size = vec2(380, 190)
-  local pos = vec2(uiState.windowSize.x / 2 - size.x / 2, 60)
+  local W, H = 460, 250
+  local pos = vec2(uiState.windowSize.x / 2 - W / 2, 50)
 
-  ui.transparentWindow('nohesiScore', pos, size, function()
+  ui.transparentWindow('nohesiScore', pos, vec2(W, H), function()
     ui.pushDWriteFont('Segoe UI;Weight=Bold')
 
+    local o = ui.getCursor()
+    local left, right, cx = 30, W - 30, W / 2
+    local ar, ag, ab = 0.55, 0.85, 1.0   -- accent colour
+    local panelH = 100
+
+    if S.phase == 'running' then
+      ar, ag, ab = multRGB(S.mult)
+      panelH = 126
+    elseif S.phase == 'finished' then
+      if S.endReason == 'TIME UP' then ar, ag, ab = 1.0, 0.8, 0.3
+      else ar, ag, ab = 1.0, 0.35, 0.3 end
+      panelH = 132
+    end
+
+    local accent = rgbm(ar, ag, ab, 1)
+
+    -- panel
+    ui.drawRectFilled(o + vec2(10, 0), o + vec2(W - 10, panelH),
+      rgbm(0.04, 0.05, 0.08, 0.78), 14, ui.CornerFlags.All)
+    ui.drawRect(o + vec2(10, 0), o + vec2(W - 10, panelH),
+      rgbm(ar, ag, ab, 0.85), 14, ui.CornerFlags.All, 2)
+
     if S.phase == 'idle' then
-      ui.dwriteText('PASS A CAR TO START', 24, rgbm(1, 1, 1, 1))
-      ui.dwriteText(fmtTime(CFG.ROUND_TIME_S) .. ' round   best ' .. storage.bestScore,
-        16, rgbm(0.8, 0.9, 1, 1))
+      textCenter('PASS A CAR TO START', 26, cx, 20, WHITE)
+      textCenter(fmtTime(CFG.ROUND_TIME_S) .. ' ROUND     BEST ' .. storage.bestScore,
+        16, cx, 62, GREY)
 
     elseif S.phase == 'running' then
       local urgent = S.timeLeft < 20
-      ui.dwriteText('TIME  ' .. fmtTime(S.timeLeft), 24,
-        urgent and rgbm(1, 0.4, 0.3, 1) or rgbm(1, 1, 1, 1))
-      ui.dwriteText('SCORE  ' .. math.floor(S.score), 30, rgbm(1, 1, 1, 1))
-      ui.dwriteText(
-        string.format('x%.2f   combo %d   crashes %d/%d   best %d',
-          S.mult, S.combo, S.crashes, CFG.MAX_CRASHES, storage.bestScore),
-        16, rgbm(0.8, 0.9, 1, 1))
+
+      -- left: time
+      ui.dwriteDrawText('TIME', 12, o + vec2(left, 9), GREY)
+      ui.dwriteDrawText(fmtTime(S.timeLeft), 30, o + vec2(left, 23),
+        urgent and rgbm(1, 0.4, 0.3, 1) or WHITE)
+
+      -- right: best
+      textRight('BEST', 12, right, 9, GREY)
+      textRight(tostring(storage.bestScore), 30, right, 23, WHITE)
+
+      -- centre: score
+      textCenter('SCORE', 12, cx, 7, GREY)
+      textCenter(tostring(math.floor(S.score)), 44, cx, 17, WHITE)
+
+      -- bottom row: combo / multiplier / crashes
+      ui.dwriteDrawText('COMBO ' .. S.combo, 16, o + vec2(left, 78), GREY)
+      textCenter(string.format('x%.2f', S.mult), 30, cx, 70, accent)
+      textRight('CRASH ' .. S.crashes .. '/' .. CFG.MAX_CRASHES, 16, right, 78,
+        S.crashes > 0 and rgbm(1, 0.4, 0.35, 1) or GREY)
 
       -- combo timer bar
+      local barL, barR, barY = o.x + left, o.x + right, o.y + 112
+      ui.drawRectFilled(vec2(barL, barY), vec2(barR, barY + 6),
+        rgbm(1, 1, 1, 0.12), 3, ui.CornerFlags.All)
       if S.combo > 0 then
         local frac = math.saturate(S.comboTimer / CFG.COMBO_TIMEOUT_S)
-        local y = pos.y + 108
-        ui.drawRectFilled(vec2(pos.x, y), vec2(pos.x + size.x * frac, y + 6),
-          rgbm(0.2, 0.8, 0.3, 0.9))
+        if frac > 0.01 then
+          ui.drawRectFilled(vec2(barL, barY), vec2(barL + (barR - barL) * frac, barY + 6),
+            rgbm(ar, ag, ab, 0.95), 3, ui.CornerFlags.All)
+        end
       end
 
+      -- popup under the panel
       if S.popupTimer > 0 then
-        local col = S.popupGood and rgbm(0.4, 1, 0.5, math.saturate(S.popupTimer))
-                                or rgbm(1, 0.35, 0.3, math.saturate(S.popupTimer))
-        ui.dwriteText(S.popup, 22, col)
+        local a = math.saturate(S.popupTimer)
+        local drift = (1 - S.popupTimer / 1.8) * 14
+        local col = S.popupGood and rgbm(0.4, 1, 0.5, a) or rgbm(1, 0.35, 0.3, a)
+        textCenter(S.popup, 28, cx, panelH + 8 + drift, col)
       end
 
     else -- finished
-      local crashedOut = S.endReason ~= 'TIME UP'
-      ui.dwriteText(S.endReason, 26,
-        crashedOut and rgbm(1, 0.35, 0.3, 1) or rgbm(1, 0.8, 0.3, 1))
-      ui.dwriteText('FINAL SCORE  ' .. math.floor(S.score), 30, rgbm(1, 1, 1, 1))
+      textCenter(S.endReason, 22, cx, 8, accent)
+      textCenter('FINAL SCORE', 12, cx, 36, GREY)
+      textCenter(tostring(math.floor(S.score)), 44, cx, 48, WHITE)
       if S.newBest then
-        ui.dwriteText('NEW PERSONAL BEST!', 20, rgbm(0.4, 1, 0.5, 1))
+        textCenter('NEW PERSONAL BEST!', 17, cx, 104, rgbm(0.4, 1, 0.5, 1))
       else
-        ui.dwriteText('best ' .. storage.bestScore, 16, rgbm(0.8, 0.9, 1, 1))
+        textCenter('BEST ' .. storage.bestScore, 17, cx, 104, GREY)
       end
     end
 
