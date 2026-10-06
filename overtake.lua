@@ -29,9 +29,9 @@ local CFG = {
   PIT_RESET_SAVES_BEST = true, -- true: score is banked toward your best when you return to pits. false: score is thrown away
   TELEPORT_DIST      = 200,   -- a jump bigger than this (m) in one frame counts as a teleport to pits
   -- Discord leaderboard (see worker.js). Leave LEADERBOARD_URL empty to turn it off.
-  LEADERBOARD_URL    = '',    -- your Cloudflare Worker URL
-  LEADERBOARD_KEY    = '',    -- same value as SUBMIT_KEY in the Worker
-  MIN_SUBMIT_SCORE   = 1000,  -- runs scoring less than this are not sent
+  LEADERBOARD_URL    = 'https://swimteamleaderboard.tajewithehs.workers.dev',    -- your Cloudflare Worker URL
+  LEADERBOARD_KEY    = 'k7Qm29xPzr41',    -- same value as SUBMIT_KEY in the Worker
+  MIN_SUBMIT_SCORE   = 10000,  -- runs scoring less than this are not sent
   -- Only cars whose folder name contains one of these words count as traffic.
   -- "traffic" matches traffic_* and nohesi_traffic_* cars. Other players
   -- are not counted. Leave the list empty to count every other car.
