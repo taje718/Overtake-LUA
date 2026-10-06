@@ -36,6 +36,10 @@ local CFG = {
   -- "traffic" matches traffic_* and nohesi_traffic_* cars. Other players
   -- are not counted. Leave the list empty to count every other car.
   TRAFFIC_MODELS     = { "traffic", "mtn_victoria" },
+  -- Speedometer
+  SHOW_SPEEDO        = true,
+  SPEEDO_USE_MPH     = false, -- true: show mph instead of km/h
+  SPEEDO_FALLBACK_RPM = 8000, -- used if the car does not report a limiter rpm
 }
 
 ---------------------------------------------------------------------
@@ -266,15 +270,20 @@ end
 local GREY = rgbm(0.65, 0.7, 0.78, 1)
 local WHITE = rgbm(1, 1, 1, 1)
 
-function script.drawUI()
-  local uiState = ac.getUI()
-  local W, H = 460, 250
-  local pos = vec2(uiState.windowSize.x / 2 - W / 2, 50)
+-- The window is wider than the panel (MARGIN on each side) so nothing
+-- near the edges gets clipped by the window bounds.
+local MARGIN = 30
 
-  ui.transparentWindow('nohesiScore', pos, vec2(W, H), function()
+local function drawScoreHud()
+  local uiState = ac.getUI()
+  local W, H = 460, 250                       -- panel size
+  local winW, winH = W + MARGIN * 2, H + 20   -- window size (extra room)
+  local pos = vec2(uiState.windowSize.x / 2 - winW / 2, 50)
+
+  ui.transparentWindow('nohesiScore', pos, vec2(winW, winH), function()
     ui.pushDWriteFont('Segoe UI;Weight=Bold')
 
-    local o = ui.getCursor()
+    local o = ui.getCursor() + vec2(MARGIN, 0)
     local left, right, cx = 30, W - 30, W / 2
     local ar, ag, ab = 0.55, 0.85, 1.0   -- accent colour
     local panelH = 100
@@ -297,9 +306,9 @@ function script.drawUI()
       rgbm(ar, ag, ab, 0.85), 14, ui.CornerFlags.All, 2)
 
     if S.phase == 'idle' then
-      textCenter('PASS A CAR TO START', 26, cx, 20, WHITE)
+      textCenter('PASS A CAR TO START', 26, o.x + cx, o.y + 20, WHITE)
       textCenter(fmtTime(CFG.ROUND_TIME_S) .. ' ROUND     BEST ' .. storage.bestScore,
-        16, cx, 62, GREY)
+        16, o.x + cx, o.y + 62, GREY)
 
     elseif S.phase == 'running' then
       local urgent = S.timeLeft < 20
@@ -310,17 +319,17 @@ function script.drawUI()
         urgent and rgbm(1, 0.4, 0.3, 1) or WHITE)
 
       -- right: best
-      textRight('BEST', 12, right, 9, GREY)
-      textRight(tostring(storage.bestScore), 30, right, 23, WHITE)
+      textRight('BEST', 12, o.x + right, o.y + 9, GREY)
+      textRight(tostring(storage.bestScore), 30, o.x + right, o.y + 23, WHITE)
 
       -- centre: score
-      textCenter('SCORE', 12, cx, 7, GREY)
-      textCenter(tostring(math.floor(S.score)), 44, cx, 17, WHITE)
+      textCenter('SCORE', 12, o.x + cx, o.y + 7, GREY)
+      textCenter(tostring(math.floor(S.score)), 44, o.x + cx, o.y + 17, WHITE)
 
       -- bottom row: combo / multiplier / crashes
       ui.dwriteDrawText('COMBO ' .. S.combo, 16, o + vec2(left, 78), GREY)
-      textCenter(string.format('x%.2f', S.mult), 30, cx, 70, accent)
-      textRight('CRASH ' .. S.crashes .. '/' .. CFG.MAX_CRASHES, 16, right, 78,
+      textCenter(string.format('x%.2f', S.mult), 30, o.x + cx, o.y + 70, accent)
+      textRight('CRASH ' .. S.crashes .. '/' .. CFG.MAX_CRASHES, 16, o.x + right, o.y + 78,
         S.crashes > 0 and rgbm(1, 0.4, 0.35, 1) or GREY)
 
       -- combo timer bar
@@ -340,20 +349,89 @@ function script.drawUI()
         local a = math.saturate(S.popupTimer)
         local drift = (1 - S.popupTimer / 1.8) * 14
         local col = S.popupGood and rgbm(0.4, 1, 0.5, a) or rgbm(1, 0.35, 0.3, a)
-        textCenter(S.popup, 28, cx, panelH + 8 + drift, col)
+        textCenter(S.popup, 28, o.x + cx, o.y + panelH + 8 + drift, col)
       end
 
     else -- finished
-      textCenter(S.endReason, 22, cx, 8, accent)
-      textCenter('FINAL SCORE', 12, cx, 36, GREY)
-      textCenter(tostring(math.floor(S.score)), 44, cx, 48, WHITE)
+      textCenter(S.endReason, 22, o.x + cx, o.y + 8, accent)
+      textCenter('FINAL SCORE', 12, o.x + cx, o.y + 36, GREY)
+      textCenter(tostring(math.floor(S.score)), 44, o.x + cx, o.y + 48, WHITE)
       if S.newBest then
-        textCenter('NEW PERSONAL BEST!', 17, cx, 104, rgbm(0.4, 1, 0.5, 1))
+        textCenter('NEW PERSONAL BEST!', 17, o.x + cx, o.y + 104, rgbm(0.4, 1, 0.5, 1))
       else
-        textCenter('BEST ' .. storage.bestScore, 17, cx, 104, GREY)
+        textCenter('BEST ' .. storage.bestScore, 17, o.x + cx, o.y + 104, GREY)
       end
     end
 
     ui.popDWriteFont()
   end)
+end
+
+local function drawSpeedo()
+  local player = ac.getCar(0)
+  if not player then return end
+
+  local uiState = ac.getUI()
+  local W, H = 340, 130                       -- panel size
+  local winW, winH = W + MARGIN * 2, H + 20
+  local pos = vec2(uiState.windowSize.x - winW - 20, uiState.windowSize.y - winH - 40)
+
+  local speed = player.speedKmh
+  local unit = 'KM/H'
+  if CFG.SPEEDO_USE_MPH then speed, unit = speed * 0.621371, 'MPH' end
+
+  local rpm = player.rpm or 0
+  local maxRpm = player.rpmLimiter
+  if not maxRpm or maxRpm < 1000 then maxRpm = CFG.SPEEDO_FALLBACK_RPM end
+  local frac = math.saturate(rpm / maxRpm)
+
+  local gear = player.gear or 0
+  local gearText = gear < 0 and 'R' or (gear == 0 and 'N' or tostring(gear))
+
+  ui.transparentWindow('nohesiSpeedo', pos, vec2(winW, winH), function()
+    ui.pushDWriteFont('Segoe UI;Weight=Bold')
+
+    local o = ui.getCursor() + vec2(MARGIN, 0)
+    local hot = frac > 0.92
+    local accent = hot and rgbm(1, 0.3, 0.25, 1) or rgbm(0.55, 0.85, 1, 1)
+
+    ui.drawRectFilled(o + vec2(10, 0), o + vec2(W - 10, H),
+      rgbm(0.04, 0.05, 0.08, 0.78), 14, ui.CornerFlags.All)
+    ui.drawRect(o + vec2(10, 0), o + vec2(W - 10, H),
+      rgbm(accent.r, accent.g, accent.b, 0.85), 14, ui.CornerFlags.All, 2)
+
+    -- speed (left)
+    ui.dwriteDrawText('SPEED', 12, o + vec2(30, 8), GREY)
+    ui.dwriteDrawText(tostring(math.floor(speed + 0.5)), 52, o + vec2(30, 20), WHITE)
+    ui.dwriteDrawText(unit, 14, o + vec2(30, 76), GREY)
+
+    -- gear (right)
+    textRight('GEAR', 12, o.x + W - 30, o.y + 8, GREY)
+    textRight(gearText, 52, o.x + W - 30, o.y + 20, accent)
+
+    -- rpm text (centre)
+    textCenter(string.format('%d RPM', math.floor(rpm + 0.5)), 16, o.x + W / 2, o.y + 54, GREY)
+
+    -- segmented rpm bar
+    local segs = 30
+    local bx, bw, by = o.x + 30, W - 60, o.y + 100
+    local segW = bw / segs
+    for i = 0, segs - 1 do
+      local t = (i + 1) / segs
+      local lit = t <= frac + 0.0001
+      local col
+      if t > 0.85 then col = rgbm(1, 0.3, 0.25, lit and 1 or 0.18)
+      elseif t > 0.65 then col = rgbm(1, 0.85, 0.2, lit and 1 or 0.18)
+      else col = rgbm(0.55, 0.85, 1, lit and 1 or 0.18) end
+      ui.drawRectFilled(vec2(bx + i * segW, by), vec2(bx + (i + 1) * segW - 3, by + 12),
+        col, 2, ui.CornerFlags.All)
+    end
+
+    ui.popDWriteFont()
+  end)
+end
+
+function script.drawUI()
+  drawScoreHud()
+  if CFG.SHOW_SPEEDO then drawSpeedo() end
 end
