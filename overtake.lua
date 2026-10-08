@@ -5,14 +5,17 @@
 -- Scoring per pass:
 --   (base + speed bonus) x PROXIMITY multiplier x SPEED multiplier
 --     PROXIMITY: closer = bigger, up to PROX_MULT_MAX
---     SPEED:     x1.0 at 0 mph, rising to x2.0 at 200 mph
+--     SPEED:     x1.1 at 0 km/h, rising evenly to x4.0 at 300 km/h (186.4 mph).
+--                The current value is shown live on the speedometer.
 --   + SQUEEZE bonus when several cars are passed within SQUEEZE_WINDOW_S
 --     of each other (e.g. threading between two cars). The squeeze bonus
 --     grows with the number of cars and how close you were to all of them.
 --   all of that is then multiplied by the combo multiplier.
 --
 -- When the run ends, a CLEAN RUN bonus is added to the final score:
---   no crashes +50%, 1 crash +25%, run ended by crashing out +0%.
+--   no crashes: +50,000 flat, then +50%; 1 crash: +25,000 flat, then +25%;
+--   run ended by crashing out: nothing. (The flat points are added first and
+--   the percentage is applied to the total including them.)
 --
 -- Leaderboard: each submitted run includes the car you used and your
 -- average speed over the run (AVG MPH). The final score screen shows the
@@ -42,8 +45,9 @@ local CFG = {
   SPEED_BONUS_PER_10 = 5,     -- extra points per 10 km/h above SPEED_BONUS_FROM
   SPEED_BONUS_FROM   = 80,
   -- Speed multiplier (applied to every pass)
-  SPEED_MULT_MAX     = 2.0,   -- multiplier you get at SPEED_MULT_FULL_MPH (it is x1.0 at 0 mph)
-  SPEED_MULT_FULL_MPH = 200,  -- speed (mph) that earns the max speed multiplier
+  SPEED_MULT_MIN     = 1.1,   -- multiplier at 0 km/h
+  SPEED_MULT_MAX     = 4.0,   -- multiplier at SPEED_MULT_FULL_KMH and above
+  SPEED_MULT_FULL_KMH = 300,  -- speed (km/h) that earns the max speed multiplier (300 km/h = 186.4 mph)
   -- Proximity multiplier (sideways distance between car centres, in metres)
   PROX_NEAR_LATERAL  = 2.0,   -- at or below this you get the full PROX_MULT_MAX
   PROX_FAR_LATERAL   = 4.0,   -- at or above this the multiplier is x1.0
@@ -51,6 +55,7 @@ local CFG = {
   PROX_POPUP_FROM    = 1.5,   -- show "CLOSE PASS" when the proximity mult reaches this
   -- Squeeze bonus (passing several cars within a short time of each other)
   SQUEEZE_WINDOW_S   = 0.3,   -- each extra pass must come within this time of the previous one
+  SQUEEZE_BONUS_SCALE = 1.5,  -- scales the whole squeeze bonus (1.0 = original, 1.5 = +50%)
   SQUEEZE_BASE       = 0.5,   -- bonus multiplier added per extra car, even if they were far apart
   SQUEEZE_PROX       = 1.0,   -- extra per extra car at full proximity (scaled by average closeness)
   SQUEEZE_MAX_CARS   = 5,     -- cars beyond this stop adding to the squeeze multiplier
@@ -62,12 +67,15 @@ local CFG = {
   -- Clean run bonus: fraction of your final score added, by number of crashes in the run.
   -- Crash counts that are not listed (and runs that end by crashing out) get no bonus.
   CLEAN_BONUS        = { [0] = 0.5, [1] = 0.25 },
+  -- Flat clean run bonus (points), by number of crashes. Added to your score first,
+  -- and then the percentage bonus above is applied on top of that total.
+  CLEAN_FLAT         = { [0] = 50000, [1] = 25000 },
   PIT_RESET_SAVES_BEST = true, -- true: score is banked toward your best when you return to pits. false: score is thrown away
   TELEPORT_DIST      = 200,   -- a jump bigger than this (m) in one frame counts as a teleport to pits
   -- Discord leaderboard (see worker.js). Leave LEADERBOARD_URL empty to turn it off.
   LEADERBOARD_URL    = 'https://swimteamleaderboard.tajewithehs.workers.dev',    -- your Cloudflare Worker URL
   LEADERBOARD_KEY    = 'k7Qm29xPzr41',    -- same value as SUBMIT_KEY in the Worker
-  MIN_SUBMIT_SCORE   = 10000,  -- runs scoring less than this are not sent
+  MIN_SUBMIT_SCORE   = 100000,  -- runs scoring less than this are not sent
   -- Only cars whose folder name contains one of these words count as traffic.
   -- "traffic" matches traffic_* and nohesi_traffic_* cars. Other players
   -- are not counted. Leave the list empty to count every other car.
@@ -103,7 +111,8 @@ local S = {
   crashCooldown = 0,
   endReason = 'TIME UP',
   cleanPct = 0,          -- clean run bonus applied to the last finished run (0.5 = +50%)
-  cleanPts = 0,          -- points that bonus added
+  cleanPts = 0,          -- points that bonus added (flat + percentage)
+  cleanFlat = 0,         -- the flat part of the clean run bonus
   cleanCrashes = 0,      -- crashes in the last finished run
   speedSum = 0,          -- sum of speed x time while running (km/h * s), for the average
   runTime = 0,           -- seconds spent running
@@ -140,7 +149,7 @@ local function startRound()
   S.score, S.combo, S.mult, S.comboTimer = 0, 0, 1.0, 0
   S.newBest = false
   S.crashes, S.crashCooldown = 0, 0
-  S.cleanPct, S.cleanPts, S.cleanCrashes = 0, 0, 0
+  S.cleanPct, S.cleanPts, S.cleanCrashes, S.cleanFlat = 0, 0, 0, 0
   S.speedSum, S.runTime, S.avgMph = 0, 0, 0
   S.group = nil
 end
@@ -150,11 +159,17 @@ local function jsonStr(s)
 end
 
 -- sends the finished run to the leaderboard relay (if configured)
-local function submitScore(score)
+-- fields: name, score, key, car (display name), carId (folder name), avgMph
+local function submitScore(score, avgMph)
   if CFG.LEADERBOARD_URL == '' or score < CFG.MIN_SUBMIT_SCORE then return end
   local name = ac.getDriverName(0) or 'Unknown'
-  local body = string.format('{"name":"%s","score":%d,"key":"%s"}',
-    jsonStr(name), score, jsonStr(CFG.LEADERBOARD_KEY))
+  local carId = ac.getCarID(0) or ''
+  local carName = carId
+  local okName, n = pcall(ac.getCarName, 0)
+  if okName and n and n ~= '' then carName = n end
+  local body = string.format('{"name":"%s","score":%d,"key":"%s","car":"%s","carId":"%s","avgMph":%.1f}',
+    jsonStr(name), score, jsonStr(CFG.LEADERBOARD_KEY),
+    jsonStr(carName), jsonStr(carId), avgMph or 0)
   local ok, e = pcall(function()
     web.post(CFG.LEADERBOARD_URL, { ['Content-Type'] = 'application/json' }, body,
       function(err, response)
@@ -175,13 +190,20 @@ local function endRound(reason)
   -- Runs that ended because you crashed out get nothing.
   local crashedOut = (S.endReason == 'CRASHED OUT')
   local pct = crashedOut and 0 or (CFG.CLEAN_BONUS[S.crashes] or 0)
+  local flat = crashedOut and 0 or (CFG.CLEAN_FLAT[S.crashes] or 0)
   S.cleanPct = pct
+  S.cleanFlat = flat
   S.cleanCrashes = S.crashes
-  S.cleanPts = math.floor(S.score * pct)
+  -- flat bonus goes in first, then the percentage applies to the total
+  S.cleanPts = flat + math.floor((S.score + flat) * pct)
   S.score = S.score + S.cleanPts
 
+  -- average speed over the run (time-weighted), in mph
+  local avgKmh = S.runTime > 0 and (S.speedSum / S.runTime) or 0
+  S.avgMph = avgKmh * 0.621371
+
   local final = math.floor(S.score)
-  submitScore(final)
+  submitScore(final, S.avgMph)
   if final > storage.bestScore then
     storage.bestScore = final
     S.newBest = true
@@ -194,11 +216,10 @@ local function proximityFactor(lateral)
   return math.saturate((CFG.PROX_FAR_LATERAL - lateral) / span)
 end
 
--- x1.0 at 0 mph, rising in a straight line to SPEED_MULT_MAX at SPEED_MULT_FULL_MPH
+-- x1.1 at 0 km/h, rising in a straight line to x4.0 at 300 km/h (186.4 mph)
 local function speedMultiplier(speedKmh)
-  local mph = speedKmh * 0.621371
-  local t = math.saturate(mph / math.max(1, CFG.SPEED_MULT_FULL_MPH))
-  return 1.0 + (CFG.SPEED_MULT_MAX - 1.0) * t
+  local t = math.saturate(speedKmh / math.max(1, CFG.SPEED_MULT_FULL_KMH))
+  return CFG.SPEED_MULT_MIN + (CFG.SPEED_MULT_MAX - CFG.SPEED_MULT_MIN) * t
 end
 
 local function registerPass(speed, lateral)
@@ -234,7 +255,7 @@ local function registerPass(speed, lateral)
     local cars = math.min(g.n, CFG.SQUEEZE_MAX_CARS)
     local avgProx = g.sumProx / g.n
     local squeezeMult = 1.0 + (cars - 1) * (CFG.SQUEEZE_BASE + CFG.SQUEEZE_PROX * avgProx)
-    squeezePay = math.max(0, g.sumPts * (squeezeMult - 1.0) - g.paid)
+    squeezePay = math.max(0, g.sumPts * (squeezeMult - 1.0) * CFG.SQUEEZE_BONUS_SCALE - g.paid)
     g.paid = g.paid + squeezePay
   end
 
@@ -257,10 +278,12 @@ end
 
 -- text for the clean run line on the final score screen
 local function cleanText()
-  if S.cleanPct > 0 then
-    local pct = string.format('+%d%%', math.floor(S.cleanPct * 100 + 0.5))
+  if S.cleanPts > 0 then
     local label = (S.cleanCrashes == 0) and 'CLEAN RUN' or (S.cleanCrashes .. ' HIT')
-    return label .. '  ' .. pct .. '  (+' .. S.cleanPts .. ')'
+    local parts = {}
+    if S.cleanFlat > 0 then parts[#parts + 1] = '+' .. S.cleanFlat end
+    if S.cleanPct > 0 then parts[#parts + 1] = string.format('+%d%%', math.floor(S.cleanPct * 100 + 0.5)) end
+    return label .. '  ' .. table.concat(parts, ' ') .. '  (+' .. S.cleanPts .. ')'
   end
   return 'NO CLEAN BONUS'
 end
@@ -277,6 +300,12 @@ function script.update(dt)
 
   S.popupTimer = math.max(0, S.popupTimer - dt)
   S.clock = S.clock + dt
+
+  -- running average speed (time-weighted) for the leaderboard / result screen
+  if S.phase == 'running' then
+    S.speedSum = S.speedSum + player.speedKmh * dt
+    S.runTime = S.runTime + dt
+  end
 
   -- round timer / result screen
   if S.phase == 'running' then
@@ -410,12 +439,12 @@ local SCORE_W, SCORE_H = 460, 250   -- score panel size (the window is a bit big
 
 local function speedoPanelSize()
   local k = CFG.SPEEDO_SCALE
-  return 340 * k, 130 * k
+  return 340 * k, 176 * k
 end
 
 local function scorePanelH()
   if S.phase == 'running' then return 126 end
-  if S.phase == 'finished' then return 154 end
+  if S.phase == 'finished' then return 176 end
   return 100
 end
 
@@ -627,14 +656,18 @@ local function drawScoreHud()
       textCenter('FINAL SCORE', 12, o.x + cx, o.y + 36, GREY)
       textCenter(tostring(math.floor(S.score)), 44, o.x + cx, o.y + 48, WHITE)
 
+      -- average speed over the run
+      textCenter(string.format('AVG %d MPH', math.floor(S.avgMph + 0.5)), 16,
+        o.x + cx, o.y + 106, WHITE)
+
       -- clean run bonus line
-      textCenter(cleanText(), 16, o.x + cx, o.y + 106,
-        S.cleanPct > 0 and rgbm(0.4, 1, 0.5, 1) or GREY)
+      textCenter(cleanText(), 16, o.x + cx, o.y + 128,
+        S.cleanPts > 0 and rgbm(0.4, 1, 0.5, 1) or GREY)
 
       if S.newBest then
-        textCenter('NEW PERSONAL BEST!', 17, o.x + cx, o.y + 128, rgbm(0.4, 1, 0.5, 1))
+        textCenter('NEW PERSONAL BEST!', 17, o.x + cx, o.y + 150, rgbm(0.4, 1, 0.5, 1))
       else
-        textCenter('BEST ' .. storage.bestScore, 17, o.x + cx, o.y + 128, GREY)
+        textCenter('BEST ' .. storage.bestScore, 17, o.x + cx, o.y + 150, GREY)
       end
     end
 
@@ -726,6 +759,30 @@ local function drawSpeedo()
       else col = rgbm(0.55, 0.85, 1, lit and 1 or 0.18) end
       ui.drawRectFilled(vec2(bx + i * segW, by), vec2(bx + (i + 1) * segW - 3 * k, by + 12 * k),
         col, 2 * k, ui.CornerFlags.All)
+    end
+
+    -- SPEED MULTIPLIER indicator (what every pass is multiplied by right now)
+    do
+      local sm = speedMultiplier(player.speedKmh)
+      local t = math.saturate((sm - CFG.SPEED_MULT_MIN) / math.max(0.01, CFG.SPEED_MULT_MAX - CFG.SPEED_MULT_MIN))
+      local mcol
+      if t >= 0.999 then mcol = rgbm(1, 0.3, 0.25, 1)          -- maxed out
+      elseif t > 0.66 then mcol = rgbm(1, 0.6, 0.15, 1)
+      elseif t > 0.33 then mcol = rgbm(1, 0.85, 0.2, 1)
+      else mcol = rgbm(0.55, 0.85, 1, 1) end
+
+      ui.dwriteDrawText('SPEED MULT', 12 * k, o.x + 30 * k, o.y + 124 * k, GREY)
+      textRight(string.format('x%.2f', sm) .. (t >= 0.999 and ' MAX' or ''),
+        26 * k, o.x + W - 30 * k, o.y + 118 * k, mcol)
+
+      -- continuous bar, filled according to speed (0 -> 300 km/h)
+      local mx, mw, my = o.x + 30 * k, W - 60 * k, o.y + 152 * k
+      ui.drawRectFilled(vec2(mx, my), vec2(mx + mw, my + 10 * k),
+        rgbm(1, 1, 1, 0.12), 3 * k, ui.CornerFlags.All)
+      if t > 0.001 then
+        ui.drawRectFilled(vec2(mx, my), vec2(mx + mw * t, my + 10 * k),
+          mcol, 3 * k, ui.CornerFlags.All)
+      end
     end
 
     ui.popDWriteFont()
