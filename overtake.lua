@@ -12,6 +12,8 @@
 -- HUD: click and drag the score panel or the speedometer to move it.
 -- Right-click a panel to put it back in its default spot. Positions are
 -- remembered between sessions.
+-- Speedometer: click the MPH / KM/H switch on the speedometer to change
+-- units. It starts on MPH and your choice is remembered between sessions.
 --
 -- Add to csp_extra_options.ini:
 --   [SCRIPT_1]
@@ -58,7 +60,7 @@ local CFG = {
   -- Speedometer
   SHOW_SPEEDO        = true,
   SPEEDO_SCALE       = 1.5,   -- 1.0 = the old size, 1.5 = 50% bigger, 2.0 = double
-  SPEEDO_USE_MPH     = false, -- true: show mph instead of km/h
+  SPEEDO_USE_MPH     = true,  -- starting unit: true = mph, false = km/h (the on-screen switch changes it and is remembered)
   SPEEDO_FALLBACK_RPM = 8000, -- used if the car does not report a limiter rpm
   -- HUD
   HUD_DRAG           = true,  -- false: panels cannot be moved (they stay at their default spots)
@@ -68,6 +70,9 @@ local CFG = {
 -- STATE
 ---------------------------------------------------------------------
 local storage = ac.storage{ bestScore = 0 }
+
+-- remembered speedometer unit (starts from CFG.SPEEDO_USE_MPH the first time)
+local prefs = ac.storage{ useMph = CFG.SPEEDO_USE_MPH }
 
 local S = {
   phase = 'idle',        -- 'idle' (waiting for first pass), 'running', 'finished'
@@ -406,6 +411,20 @@ local function inRect(p, a, b)
   return p.x >= a.x and p.x <= b.x and p.y >= a.y and p.y <= b.y
 end
 
+-- The MPH / KM/H switch on the speedometer. Layout is relative to the
+-- panel's top-left corner: x, y, width of each half, height.
+local function unitSwitchLayout()
+  local k = CFG.SPEEDO_SCALE
+  return 26 * k, 73 * k, 46 * k, 22 * k
+end
+
+-- the switch in screen coordinates (for clicking)
+local function unitSwitchRect()
+  local x, y, segW, h = unitSwitchLayout()
+  local o = getPos('speedo') + vec2(MARGIN, 0)
+  return o + vec2(x, y), o + vec2(x + segW * 2, y + h)
+end
+
 local dragging = nil          -- { key = 'score'|'speedo', grab = vec2 }
 local mouseWasDown = false
 local rightWasDown = false
@@ -417,14 +436,24 @@ local function handleHudInput()
   local mp = ui.mousePos()
   local keys = { 'speedo', 'score' }
 
-  -- left press on a panel: start dragging it
+  -- left press: first check the MPH / KM/H switch, otherwise start dragging a panel
   if down and not mouseWasDown and not dragging then
-    for _, key in ipairs(keys) do
-      if key ~= 'speedo' or CFG.SHOW_SPEEDO then
-        local a, b = panelRect(key)
-        if inRect(mp, a, b) then
-          dragging = { key = key, grab = mp - getPos(key) }
-          break
+    local onSwitch = false
+    if CFG.SHOW_SPEEDO then
+      local a, b = unitSwitchRect()
+      if inRect(mp, a, b) then
+        prefs.useMph = not prefs.useMph
+        onSwitch = true
+      end
+    end
+    if not onSwitch then
+      for _, key in ipairs(keys) do
+        if key ~= 'speedo' or CFG.SHOW_SPEEDO then
+          local a, b = panelRect(key)
+          if inRect(mp, a, b) then
+            dragging = { key = key, grab = mp - getPos(key) }
+            break
+          end
         end
       end
     end
@@ -568,9 +597,9 @@ local function drawSpeedo()
   local W, H = speedoPanelSize()
   local pos = getPos('speedo')
 
+  local useMph = prefs.useMph
   local speed = player.speedKmh
-  local unit = 'KM/H'
-  if CFG.SPEEDO_USE_MPH then speed, unit = speed * 0.621371, 'MPH' end
+  if useMph then speed = speed * 0.621371 end
 
   local rpm = player.rpm or 0
   local maxRpm = player.rpmLimiter
@@ -601,7 +630,25 @@ local function drawSpeedo()
     -- speed (left)
     ui.dwriteDrawText('SPEED', 12 * k, o + vec2(30 * k, 8 * k), GREY)
     ui.dwriteDrawText(tostring(math.floor(speed + 0.5)), 52 * k, o + vec2(30 * k, 20 * k), WHITE)
-    ui.dwriteDrawText(unit, 14 * k, o + vec2(30 * k, 76 * k), GREY)
+
+    -- MPH / KM/H switch (click it to change units)
+    do
+      local sx, sy, segW, sh = unitSwitchLayout()
+      local x0, y0 = o.x + sx, o.y + sy
+      local hover = false
+      local okMouse, mp = pcall(ui.mousePos)
+      if okMouse and mp then
+        hover = inRect(mp, vec2(x0, y0), vec2(x0 + segW * 2, y0 + sh))
+      end
+      ui.drawRectFilled(vec2(x0, y0), vec2(x0 + segW * 2, y0 + sh),
+        rgbm(1, 1, 1, hover and 0.16 or 0.08), 6 * k, ui.CornerFlags.All)
+      local activeX = useMph and x0 or (x0 + segW)
+      ui.drawRectFilled(vec2(activeX, y0), vec2(activeX + segW, y0 + sh),
+        rgbm(accent.r, accent.g, accent.b, 0.9), 6 * k, ui.CornerFlags.All)
+      local dark = rgbm(0.04, 0.05, 0.08, 1)
+      textCenter('MPH', 13 * k, x0 + segW / 2, y0 + 3 * k, useMph and dark or GREY)
+      textCenter('KM/H', 13 * k, x0 + segW * 1.5, y0 + 3 * k, useMph and GREY or dark)
+    end
 
     -- gear (right)
     textRight('GEAR', 12 * k, o.x + W - 30 * k, o.y + 8 * k, GREY)
