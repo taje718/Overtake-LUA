@@ -14,6 +14,10 @@
 -- When the run ends, a CLEAN RUN bonus is added to the final score:
 --   no crashes +50%, 1 crash +25%, run ended by crashing out +0%.
 --
+-- Leaderboard: each submitted run includes the car you used and your
+-- average speed over the run (AVG MPH). The final score screen shows the
+-- average too.
+--
 -- HUD: click and drag the score panel or the speedometer to move it.
 -- Right-click a panel to put it back in its default spot. Positions are
 -- remembered between sessions.
@@ -101,6 +105,9 @@ local S = {
   cleanPct = 0,          -- clean run bonus applied to the last finished run (0.5 = +50%)
   cleanPts = 0,          -- points that bonus added
   cleanCrashes = 0,      -- crashes in the last finished run
+  speedSum = 0,          -- sum of speed x time while running (km/h * s), for the average
+  runTime = 0,           -- seconds spent running
+  avgMph = 0,            -- average speed of the last finished run
   clock = 0,             -- running time, used for the squeeze window
   group = nil,           -- current squeeze group: { n, sumPts, sumProx, paid, lastT }
   prevForward = {},      -- [carIndex] = last forward distance
@@ -134,6 +141,7 @@ local function startRound()
   S.newBest = false
   S.crashes, S.crashCooldown = 0, 0
   S.cleanPct, S.cleanPts, S.cleanCrashes = 0, 0, 0
+  S.speedSum, S.runTime, S.avgMph = 0, 0, 0
   S.group = nil
 end
 
