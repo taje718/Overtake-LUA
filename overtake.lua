@@ -2,6 +2,17 @@
 -- 3 minute rounds. Slowing down does not end anything. The combo only
 -- resets after COMBO_TIMEOUT_S with no pass, or on a crash.
 --
+-- Scoring per pass:
+--   (base + speed bonus) x PROXIMITY multiplier   (closer = bigger, up to PROX_MULT_MAX)
+--   + SQUEEZE bonus when several cars are passed within SQUEEZE_WINDOW_S
+--     of each other (e.g. threading between two cars). The squeeze bonus
+--     grows with the number of cars and how close you were to all of them.
+--   all of that is then multiplied by the combo multiplier.
+--
+-- HUD: click and drag the score panel or the speedometer to move it.
+-- Right-click a panel to put it back in its default spot. Positions are
+-- remembered between sessions.
+--
 -- Add to csp_extra_options.ini:
 --   [SCRIPT_1]
 --   SCRIPT = 'https://your-host/overtake.lua'
@@ -15,13 +26,21 @@ local CFG = {
   COMBO_TIMEOUT_S    = 10,    -- combo resets if no pass within this time
   MAX_PASS_DIST      = 25.0,  -- max total distance (m) for a pass to count
   MAX_LATERAL        = 4.0,   -- max sideways offset (m) for a pass to count
-  CLOSE_LATERAL      = 1.8,   -- passes closer than this get a close-pass bonus
   MIN_PASS_SPEED_KMH = 40,    -- you must be at least this fast for a pass to count
-  BASE_POINTS        = 100,   -- points per pass (before multiplier)
-  CLOSE_BONUS        = 50,    -- extra points for a close pass
+  BASE_POINTS        = 100,   -- points per pass (before multipliers)
   SPEED_BONUS_PER_10 = 5,     -- extra points per 10 km/h above SPEED_BONUS_FROM
   SPEED_BONUS_FROM   = 80,
-  MULT_STEP          = 0.25,  -- multiplier added per consecutive pass
+  -- Proximity multiplier (sideways distance between car centres, in metres)
+  PROX_NEAR_LATERAL  = 2.0,   -- at or below this you get the full PROX_MULT_MAX
+  PROX_FAR_LATERAL   = 4.0,   -- at or above this the multiplier is x1.0
+  PROX_MULT_MAX      = 3.0,   -- points multiplier for a paint-trading pass
+  PROX_POPUP_FROM    = 1.5,   -- show "CLOSE PASS" when the proximity mult reaches this
+  -- Squeeze bonus (passing several cars within a short time of each other)
+  SQUEEZE_WINDOW_S   = 0.3,   -- each extra pass must come within this time of the previous one
+  SQUEEZE_BASE       = 0.5,   -- bonus multiplier added per extra car, even if they were far apart
+  SQUEEZE_PROX       = 1.0,   -- extra per extra car at full proximity (scaled by average closeness)
+  SQUEEZE_MAX_CARS   = 5,     -- cars beyond this stop adding to the squeeze multiplier
+  MULT_STEP          = 0.25,  -- combo multiplier added per consecutive pass
   MULT_MAX           = 10.0,
   MAX_CRASHES        = 2,     -- the run ends on this crash (1st crash only resets the combo)
   CRASH_COOLDOWN_S   = 2.0,   -- ignore further contact this long after a crash (one scrape = one crash)
@@ -38,8 +57,11 @@ local CFG = {
   TRAFFIC_MODELS     = { "traffic", "mtn_victoria" },
   -- Speedometer
   SHOW_SPEEDO        = true,
+  SPEEDO_SCALE       = 1.5,   -- 1.0 = the old size, 1.5 = 50% bigger, 2.0 = double
   SPEEDO_USE_MPH     = false, -- true: show mph instead of km/h
   SPEEDO_FALLBACK_RPM = 8000, -- used if the car does not report a limiter rpm
+  -- HUD
+  HUD_DRAG           = true,  -- false: panels cannot be moved (they stay at their default spots)
 }
 
 ---------------------------------------------------------------------
@@ -60,6 +82,8 @@ local S = {
   crashes = 0,
   crashCooldown = 0,
   endReason = 'TIME UP',
+  clock = 0,             -- running time, used for the squeeze window
+  group = nil,           -- current squeeze group: { n, sumPts, sumProx, paid, lastT }
   prevForward = {},      -- [carIndex] = last forward distance
 }
 
@@ -90,6 +114,7 @@ local function startRound()
   S.score, S.combo, S.mult, S.comboTimer = 0, 0, 1.0, 0
   S.newBest = false
   S.crashes, S.crashCooldown = 0, 0
+  S.group = nil
 end
 
 local function jsonStr(s)
@@ -116,12 +141,19 @@ local function endRound(reason)
   S.phase = 'finished'
   S.finishTimer = CFG.RESULT_SHOW_S
   S.combo, S.mult, S.comboTimer = 0, 1.0, 0
+  S.group = nil
   local final = math.floor(S.score)
   submitScore(final)
   if final > storage.bestScore then
     storage.bestScore = final
     S.newBest = true
   end
+end
+
+-- 0 (far, at the edge of the proximity range) .. 1 (as close as it gets)
+local function proximityFactor(lateral)
+  local span = math.max(0.01, CFG.PROX_FAR_LATERAL - CFG.PROX_NEAR_LATERAL)
+  return math.saturate((CFG.PROX_FAR_LATERAL - lateral) / span)
 end
 
 local function registerPass(speed, lateral)
@@ -131,14 +163,45 @@ local function registerPass(speed, lateral)
   S.mult = math.min(CFG.MULT_MAX, 1.0 + (S.combo - 1) * CFG.MULT_STEP)
   S.comboTimer = CFG.COMBO_TIMEOUT_S
 
-  local pts = CFG.BASE_POINTS
-  local close = lateral < CFG.CLOSE_LATERAL
-  if close then pts = pts + CFG.CLOSE_BONUS end
-  pts = pts + math.max(0, (speed - CFG.SPEED_BONUS_FROM) / 10) * CFG.SPEED_BONUS_PER_10
+  -- base points + speed bonus, scaled by how close the pass was
+  local base = CFG.BASE_POINTS
+    + math.max(0, (speed - CFG.SPEED_BONUS_FROM) / 10) * CFG.SPEED_BONUS_PER_10
+  local prox = proximityFactor(lateral)
+  local proxMult = 1.0 + (CFG.PROX_MULT_MAX - 1.0) * prox
+  local passPts = base * proxMult
 
-  local gained = pts * S.mult
+  -- squeeze group: passes that follow each other within SQUEEZE_WINDOW_S
+  local g = S.group
+  if g and (S.clock - g.lastT) <= CFG.SQUEEZE_WINDOW_S then
+    g.n = g.n + 1
+    g.sumPts = g.sumPts + passPts
+    g.sumProx = g.sumProx + prox
+  else
+    g = { n = 1, sumPts = passPts, sumProx = prox, paid = 0 }
+    S.group = g
+  end
+  g.lastT = S.clock
+
+  -- the group's bonus is paid out in steps as each extra car is passed
+  local squeezePay = 0
+  if g.n >= 2 then
+    local cars = math.min(g.n, CFG.SQUEEZE_MAX_CARS)
+    local avgProx = g.sumProx / g.n
+    local squeezeMult = 1.0 + (cars - 1) * (CFG.SQUEEZE_BASE + CFG.SQUEEZE_PROX * avgProx)
+    squeezePay = math.max(0, g.sumPts * (squeezeMult - 1.0) - g.paid)
+    g.paid = g.paid + squeezePay
+  end
+
+  local gained = (passPts + squeezePay) * S.mult
   S.score = S.score + gained
-  showPopup((close and 'CLOSE PASS  +' or '+') .. math.floor(gained), true)
+
+  if g.n >= 2 then
+    showPopup(string.format('SQUEEZE x%d  +%d', g.n, math.floor(gained)), true)
+  elseif proxMult >= CFG.PROX_POPUP_FROM then
+    showPopup('CLOSE PASS  +' .. math.floor(gained), true)
+  else
+    showPopup('+' .. math.floor(gained), true)
+  end
 end
 
 local function fmtTime(t)
@@ -157,6 +220,7 @@ function script.update(dt)
   if not player then return end
 
   S.popupTimer = math.max(0, S.popupTimer - dt)
+  S.clock = S.clock + dt
 
   -- round timer / result screen
   if S.phase == 'running' then
@@ -183,6 +247,7 @@ function script.update(dt)
       S.timeLeft = CFG.ROUND_TIME_S
       S.score, S.combo, S.mult, S.comboTimer = 0, 0, 1.0, 0
       S.crashes, S.crashCooldown = 0, 0
+      S.group = nil
     end
     S.prevForward = {}
   elseif teleported then
@@ -274,27 +339,146 @@ local WHITE = rgbm(1, 1, 1, 1)
 -- near the edges gets clipped by the window bounds.
 local MARGIN = 30
 
-local function drawScoreHud()
-  local uiState = ac.getUI()
-  local W, H = 460, 250                       -- panel size
-  local winW, winH = W + MARGIN * 2, H + 20   -- window size (extra room)
-  local pos = vec2(uiState.windowSize.x / 2 - winW / 2, 50)
+---------------------------------------------------------------------
+-- HUD LAYOUT + DRAGGING
+---------------------------------------------------------------------
+local NOPOS = -99999
+local layout = ac.storage{ scoreX = NOPOS, scoreY = NOPOS, speedoX = NOPOS, speedoY = NOPOS }
 
-  ui.transparentWindow('nohesiScore', pos, vec2(winW, winH), function()
+-- positions the player has dragged the panels to (window top-left corner)
+local livePos = {}
+if layout.scoreX ~= NOPOS then livePos.score = vec2(layout.scoreX, layout.scoreY) end
+if layout.speedoX ~= NOPOS then livePos.speedo = vec2(layout.speedoX, layout.speedoY) end
+
+local SCORE_W, SCORE_H = 460, 250   -- score panel size (the window is a bit bigger)
+
+local function speedoPanelSize()
+  local k = CFG.SPEEDO_SCALE
+  return 340 * k, 130 * k
+end
+
+local function scorePanelH()
+  if S.phase == 'running' then return 126 end
+  if S.phase == 'finished' then return 132 end
+  return 100
+end
+
+local function winSizeOf(key)
+  if key == 'score' then
+    return vec2(SCORE_W + MARGIN * 2, SCORE_H + 20)
+  end
+  local w, h = speedoPanelSize()
+  return vec2(w + MARGIN * 2, h + 20)
+end
+
+local function defaultPos(key)
+  local scr = ac.getUI().windowSize
+  local ws = winSizeOf(key)
+  if key == 'score' then
+    return vec2(scr.x / 2 - ws.x / 2, 50)
+  end
+  return vec2(scr.x - ws.x - 20, scr.y - ws.y - 40)
+end
+
+-- keeps a panel on screen
+local function clampPos(p, ws)
+  local scr = ac.getUI().windowSize
+  local x = math.max(-MARGIN, math.min(p.x, scr.x - ws.x + MARGIN))
+  local y = math.max(0, math.min(p.y, scr.y - ws.y))
+  return vec2(x, y)
+end
+
+local function getPos(key)
+  local p = livePos[key] or defaultPos(key)
+  return clampPos(p, winSizeOf(key))
+end
+
+-- the visible panel (what you click on to drag), in screen coordinates
+local function panelRect(key)
+  local pos = getPos(key)
+  local w, h
+  if key == 'score' then w, h = SCORE_W, scorePanelH()
+  else w, h = speedoPanelSize() end
+  return pos + vec2(MARGIN + 10, 0), pos + vec2(MARGIN + w - 10, h)
+end
+
+local function inRect(p, a, b)
+  return p.x >= a.x and p.x <= b.x and p.y >= a.y and p.y <= b.y
+end
+
+local dragging = nil          -- { key = 'score'|'speedo', grab = vec2 }
+local mouseWasDown = false
+local rightWasDown = false
+local dragErrorLogged = false
+
+local function handleHudInput()
+  local down = ui.mouseDown(ui.MouseButton.Left)
+  local rdown = ui.mouseDown(ui.MouseButton.Right)
+  local mp = ui.mousePos()
+  local keys = { 'speedo', 'score' }
+
+  -- left press on a panel: start dragging it
+  if down and not mouseWasDown and not dragging then
+    for _, key in ipairs(keys) do
+      if key ~= 'speedo' or CFG.SHOW_SPEEDO then
+        local a, b = panelRect(key)
+        if inRect(mp, a, b) then
+          dragging = { key = key, grab = mp - getPos(key) }
+          break
+        end
+      end
+    end
+  end
+
+  -- right click on a panel: put it back in its default spot
+  if rdown and not rightWasDown then
+    for _, key in ipairs(keys) do
+      local a, b = panelRect(key)
+      if inRect(mp, a, b) then
+        livePos[key] = nil
+        layout[key .. 'X'] = NOPOS
+        layout[key .. 'Y'] = NOPOS
+        break
+      end
+    end
+  end
+
+  if dragging then
+    if down then
+      livePos[dragging.key] = clampPos(mp - dragging.grab, winSizeOf(dragging.key))
+    else
+      local p = livePos[dragging.key]
+      if p then
+        layout[dragging.key .. 'X'] = p.x
+        layout[dragging.key .. 'Y'] = p.y
+      end
+      dragging = nil
+    end
+  end
+
+  mouseWasDown, rightWasDown = down, rdown
+end
+
+---------------------------------------------------------------------
+-- SCORE HUD
+---------------------------------------------------------------------
+local function drawScoreHud()
+  local W = SCORE_W
+  local pos = getPos('score')
+
+  ui.transparentWindow('nohesiScore', pos, winSizeOf('score'), function()
     ui.pushDWriteFont('Segoe UI;Weight=Bold')
 
     local o = ui.getCursor() + vec2(MARGIN, 0)
     local left, right, cx = 30, W - 30, W / 2
     local ar, ag, ab = 0.55, 0.85, 1.0   -- accent colour
-    local panelH = 100
+    local panelH = scorePanelH()
 
     if S.phase == 'running' then
       ar, ag, ab = multRGB(S.mult)
-      panelH = 126
     elseif S.phase == 'finished' then
       if S.endReason == 'TIME UP' then ar, ag, ab = 1.0, 0.8, 0.3
       else ar, ag, ab = 1.0, 0.35, 0.3 end
-      panelH = 132
     end
 
     local accent = rgbm(ar, ag, ab, 1)
@@ -304,6 +488,12 @@ local function drawScoreHud()
       rgbm(0.04, 0.05, 0.08, 0.78), 14, ui.CornerFlags.All)
     ui.drawRect(o + vec2(10, 0), o + vec2(W - 10, panelH),
       rgbm(ar, ag, ab, 0.85), 14, ui.CornerFlags.All, 2)
+
+    -- white outline while the panel is being dragged
+    if dragging and dragging.key == 'score' then
+      ui.drawRect(o + vec2(6, -4), o + vec2(W - 6, panelH + 4),
+        rgbm(1, 1, 1, 0.55), 16, ui.CornerFlags.All, 1)
+    end
 
     if S.phase == 'idle' then
       textCenter('PASS A CAR TO START', 26, o.x + cx, o.y + 20, WHITE)
@@ -367,14 +557,16 @@ local function drawScoreHud()
   end)
 end
 
+---------------------------------------------------------------------
+-- SPEEDOMETER
+---------------------------------------------------------------------
 local function drawSpeedo()
   local player = ac.getCar(0)
   if not player then return end
 
-  local uiState = ac.getUI()
-  local W, H = 340, 130                       -- panel size
-  local winW, winH = W + MARGIN * 2, H + 20
-  local pos = vec2(uiState.windowSize.x - winW - 20, uiState.windowSize.y - winH - 40)
+  local k = CFG.SPEEDO_SCALE
+  local W, H = speedoPanelSize()
+  local pos = getPos('speedo')
 
   local speed = player.speedKmh
   local unit = 'KM/H'
@@ -388,7 +580,7 @@ local function drawSpeedo()
   local gear = player.gear or 0
   local gearText = gear < 0 and 'R' or (gear == 0 and 'N' or tostring(gear))
 
-  ui.transparentWindow('nohesiSpeedo', pos, vec2(winW, winH), function()
+  ui.transparentWindow('nohesiSpeedo', pos, winSizeOf('speedo'), function()
     ui.pushDWriteFont('Segoe UI;Weight=Bold')
 
     local o = ui.getCursor() + vec2(MARGIN, 0)
@@ -396,25 +588,31 @@ local function drawSpeedo()
     local accent = hot and rgbm(1, 0.3, 0.25, 1) or rgbm(0.55, 0.85, 1, 1)
 
     ui.drawRectFilled(o + vec2(10, 0), o + vec2(W - 10, H),
-      rgbm(0.04, 0.05, 0.08, 0.78), 14, ui.CornerFlags.All)
+      rgbm(0.04, 0.05, 0.08, 0.78), 14 * k, ui.CornerFlags.All)
     ui.drawRect(o + vec2(10, 0), o + vec2(W - 10, H),
-      rgbm(accent.r, accent.g, accent.b, 0.85), 14, ui.CornerFlags.All, 2)
+      rgbm(accent.r, accent.g, accent.b, 0.85), 14 * k, ui.CornerFlags.All, 2)
+
+    -- white outline while the panel is being dragged
+    if dragging and dragging.key == 'speedo' then
+      ui.drawRect(o + vec2(6, -4), o + vec2(W - 6, H + 4),
+        rgbm(1, 1, 1, 0.55), 16 * k, ui.CornerFlags.All, 1)
+    end
 
     -- speed (left)
-    ui.dwriteDrawText('SPEED', 12, o + vec2(30, 8), GREY)
-    ui.dwriteDrawText(tostring(math.floor(speed + 0.5)), 52, o + vec2(30, 20), WHITE)
-    ui.dwriteDrawText(unit, 14, o + vec2(30, 76), GREY)
+    ui.dwriteDrawText('SPEED', 12 * k, o + vec2(30 * k, 8 * k), GREY)
+    ui.dwriteDrawText(tostring(math.floor(speed + 0.5)), 52 * k, o + vec2(30 * k, 20 * k), WHITE)
+    ui.dwriteDrawText(unit, 14 * k, o + vec2(30 * k, 76 * k), GREY)
 
     -- gear (right)
-    textRight('GEAR', 12, o.x + W - 30, o.y + 8, GREY)
-    textRight(gearText, 52, o.x + W - 30, o.y + 20, accent)
+    textRight('GEAR', 12 * k, o.x + W - 30 * k, o.y + 8 * k, GREY)
+    textRight(gearText, 52 * k, o.x + W - 30 * k, o.y + 20 * k, accent)
 
     -- rpm text (centre)
-    textCenter(string.format('%d RPM', math.floor(rpm + 0.5)), 16, o.x + W / 2, o.y + 54, GREY)
+    textCenter(string.format('%d RPM', math.floor(rpm + 0.5)), 16 * k, o.x + W / 2, o.y + 54 * k, GREY)
 
     -- segmented rpm bar
     local segs = 30
-    local bx, bw, by = o.x + 30, W - 60, o.y + 100
+    local bx, bw, by = o.x + 30 * k, W - 60 * k, o.y + 100 * k
     local segW = bw / segs
     for i = 0, segs - 1 do
       local t = (i + 1) / segs
@@ -423,8 +621,8 @@ local function drawSpeedo()
       if t > 0.85 then col = rgbm(1, 0.3, 0.25, lit and 1 or 0.18)
       elseif t > 0.65 then col = rgbm(1, 0.85, 0.2, lit and 1 or 0.18)
       else col = rgbm(0.55, 0.85, 1, lit and 1 or 0.18) end
-      ui.drawRectFilled(vec2(bx + i * segW, by), vec2(bx + (i + 1) * segW - 3, by + 12),
-        col, 2, ui.CornerFlags.All)
+      ui.drawRectFilled(vec2(bx + i * segW, by), vec2(bx + (i + 1) * segW - 3 * k, by + 12 * k),
+        col, 2 * k, ui.CornerFlags.All)
     end
 
     ui.popDWriteFont()
@@ -432,6 +630,18 @@ local function drawSpeedo()
 end
 
 function script.drawUI()
+  if CFG.HUD_DRAG then
+    local ok, err = pcall(handleHudInput)
+    if not ok then
+      -- if the mouse API misbehaves, just turn dragging off instead of breaking the HUD
+      if not dragErrorLogged then
+        dragErrorLogged = true
+        ac.log('HUD dragging disabled: ' .. tostring(err))
+      end
+      CFG.HUD_DRAG = false
+      dragging = nil
+    end
+  end
   drawScoreHud()
   if CFG.SHOW_SPEEDO then drawSpeedo() end
 end
