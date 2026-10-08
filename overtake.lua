@@ -3,11 +3,16 @@
 -- resets after COMBO_TIMEOUT_S with no pass, or on a crash.
 --
 -- Scoring per pass:
---   (base + speed bonus) x PROXIMITY multiplier   (closer = bigger, up to PROX_MULT_MAX)
+--   (base + speed bonus) x PROXIMITY multiplier x SPEED multiplier
+--     PROXIMITY: closer = bigger, up to PROX_MULT_MAX
+--     SPEED:     x1.0 at 0 mph, rising to x2.0 at 200 mph
 --   + SQUEEZE bonus when several cars are passed within SQUEEZE_WINDOW_S
 --     of each other (e.g. threading between two cars). The squeeze bonus
 --     grows with the number of cars and how close you were to all of them.
 --   all of that is then multiplied by the combo multiplier.
+--
+-- When the run ends, a CLEAN RUN bonus is added to the final score:
+--   no crashes +50%, 1 crash +25%, run ended by crashing out +0%.
 --
 -- HUD: click and drag the score panel or the speedometer to move it.
 -- Right-click a panel to put it back in its default spot. Positions are
@@ -32,6 +37,9 @@ local CFG = {
   BASE_POINTS        = 100,   -- points per pass (before multipliers)
   SPEED_BONUS_PER_10 = 5,     -- extra points per 10 km/h above SPEED_BONUS_FROM
   SPEED_BONUS_FROM   = 80,
+  -- Speed multiplier (applied to every pass)
+  SPEED_MULT_MAX     = 2.0,   -- multiplier you get at SPEED_MULT_FULL_MPH (it is x1.0 at 0 mph)
+  SPEED_MULT_FULL_MPH = 200,  -- speed (mph) that earns the max speed multiplier
   -- Proximity multiplier (sideways distance between car centres, in metres)
   PROX_NEAR_LATERAL  = 2.0,   -- at or below this you get the full PROX_MULT_MAX
   PROX_FAR_LATERAL   = 4.0,   -- at or above this the multiplier is x1.0
@@ -47,6 +55,9 @@ local CFG = {
   MAX_CRASHES        = 2,     -- the run ends on this crash (1st crash only resets the combo)
   CRASH_COOLDOWN_S   = 2.0,   -- ignore further contact this long after a crash (one scrape = one crash)
   CRASH_SCORE_LOSS   = 0.0,   -- fraction of round score lost on a non-final crash (0 = none, 0.5 = half)
+  -- Clean run bonus: fraction of your final score added, by number of crashes in the run.
+  -- Crash counts that are not listed (and runs that end by crashing out) get no bonus.
+  CLEAN_BONUS        = { [0] = 0.5, [1] = 0.25 },
   PIT_RESET_SAVES_BEST = true, -- true: score is banked toward your best when you return to pits. false: score is thrown away
   TELEPORT_DIST      = 200,   -- a jump bigger than this (m) in one frame counts as a teleport to pits
   -- Discord leaderboard (see worker.js). Leave LEADERBOARD_URL empty to turn it off.
@@ -87,6 +98,9 @@ local S = {
   crashes = 0,
   crashCooldown = 0,
   endReason = 'TIME UP',
+  cleanPct = 0,          -- clean run bonus applied to the last finished run (0.5 = +50%)
+  cleanPts = 0,          -- points that bonus added
+  cleanCrashes = 0,      -- crashes in the last finished run
   clock = 0,             -- running time, used for the squeeze window
   group = nil,           -- current squeeze group: { n, sumPts, sumProx, paid, lastT }
   prevForward = {},      -- [carIndex] = last forward distance
@@ -119,6 +133,7 @@ local function startRound()
   S.score, S.combo, S.mult, S.comboTimer = 0, 0, 1.0, 0
   S.newBest = false
   S.crashes, S.crashCooldown = 0, 0
+  S.cleanPct, S.cleanPts, S.cleanCrashes = 0, 0, 0
   S.group = nil
 end
 
@@ -147,6 +162,16 @@ local function endRound(reason)
   S.finishTimer = CFG.RESULT_SHOW_S
   S.combo, S.mult, S.comboTimer = 0, 1.0, 0
   S.group = nil
+
+  -- clean run bonus: the fewer times you hit something, the more score you keep.
+  -- Runs that ended because you crashed out get nothing.
+  local crashedOut = (S.endReason == 'CRASHED OUT')
+  local pct = crashedOut and 0 or (CFG.CLEAN_BONUS[S.crashes] or 0)
+  S.cleanPct = pct
+  S.cleanCrashes = S.crashes
+  S.cleanPts = math.floor(S.score * pct)
+  S.score = S.score + S.cleanPts
+
   local final = math.floor(S.score)
   submitScore(final)
   if final > storage.bestScore then
@@ -161,6 +186,13 @@ local function proximityFactor(lateral)
   return math.saturate((CFG.PROX_FAR_LATERAL - lateral) / span)
 end
 
+-- x1.0 at 0 mph, rising in a straight line to SPEED_MULT_MAX at SPEED_MULT_FULL_MPH
+local function speedMultiplier(speedKmh)
+  local mph = speedKmh * 0.621371
+  local t = math.saturate(mph / math.max(1, CFG.SPEED_MULT_FULL_MPH))
+  return 1.0 + (CFG.SPEED_MULT_MAX - 1.0) * t
+end
+
 local function registerPass(speed, lateral)
   if S.phase == 'idle' then startRound() end
 
@@ -168,12 +200,13 @@ local function registerPass(speed, lateral)
   S.mult = math.min(CFG.MULT_MAX, 1.0 + (S.combo - 1) * CFG.MULT_STEP)
   S.comboTimer = CFG.COMBO_TIMEOUT_S
 
-  -- base points + speed bonus, scaled by how close the pass was
+  -- base points + speed bonus, scaled by how close the pass was and how fast you were going
   local base = CFG.BASE_POINTS
     + math.max(0, (speed - CFG.SPEED_BONUS_FROM) / 10) * CFG.SPEED_BONUS_PER_10
   local prox = proximityFactor(lateral)
   local proxMult = 1.0 + (CFG.PROX_MULT_MAX - 1.0) * prox
-  local passPts = base * proxMult
+  local speedMult = speedMultiplier(speed)
+  local passPts = base * proxMult * speedMult
 
   -- squeeze group: passes that follow each other within SQUEEZE_WINDOW_S
   local g = S.group
@@ -212,6 +245,16 @@ end
 local function fmtTime(t)
   t = math.max(0, math.ceil(t))
   return string.format('%d:%02d', math.floor(t / 60), t % 60)
+end
+
+-- text for the clean run line on the final score screen
+local function cleanText()
+  if S.cleanPct > 0 then
+    local pct = string.format('+%d%%', math.floor(S.cleanPct * 100 + 0.5))
+    local label = (S.cleanCrashes == 0) and 'CLEAN RUN' or (S.cleanCrashes .. ' HIT')
+    return label .. '  ' .. pct .. '  (+' .. S.cleanPts .. ')'
+  end
+  return 'NO CLEAN BONUS'
 end
 
 ---------------------------------------------------------------------
@@ -364,7 +407,7 @@ end
 
 local function scorePanelH()
   if S.phase == 'running' then return 126 end
-  if S.phase == 'finished' then return 132 end
+  if S.phase == 'finished' then return 154 end
   return 100
 end
 
@@ -575,10 +618,15 @@ local function drawScoreHud()
       textCenter(S.endReason, 22, o.x + cx, o.y + 8, accent)
       textCenter('FINAL SCORE', 12, o.x + cx, o.y + 36, GREY)
       textCenter(tostring(math.floor(S.score)), 44, o.x + cx, o.y + 48, WHITE)
+
+      -- clean run bonus line
+      textCenter(cleanText(), 16, o.x + cx, o.y + 106,
+        S.cleanPct > 0 and rgbm(0.4, 1, 0.5, 1) or GREY)
+
       if S.newBest then
-        textCenter('NEW PERSONAL BEST!', 17, o.x + cx, o.y + 104, rgbm(0.4, 1, 0.5, 1))
+        textCenter('NEW PERSONAL BEST!', 17, o.x + cx, o.y + 128, rgbm(0.4, 1, 0.5, 1))
       else
-        textCenter('BEST ' .. storage.bestScore, 17, o.x + cx, o.y + 104, GREY)
+        textCenter('BEST ' .. storage.bestScore, 17, o.x + cx, o.y + 128, GREY)
       end
     end
 
