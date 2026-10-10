@@ -21,19 +21,6 @@
 -- average speed over the run (AVG MPH). The final score screen shows the
 -- average too.
 --
--- COMMUTE MODE (separate game mode)
---   Players in entry list slot COMMUTE_FIRST_SLOT (41) or higher get the
---   commute mode INSTEAD of the overtake scoring. Police cars are excluded,
---   so picking a cruiser gives you the normal overtake mode.
---   Goal: cover 15 miles in 15 minutes. The clock counts down and keeps
---   going into the negatives if you run over (it does not end the run).
---   The clock starts when you drive off (outside the pit lane).
---   Police rules (a police car within COMMUTE_POLICE_RADIUS metres):
---     - going faster than 90 mph (80 limit + 10) ends the run
---     - crashing ends the run
---   A crash with no police nearby does nothing. Going back to the pits
---   cancels the run. Commute runs are NOT sent to the leaderboard.
---
 -- HUD: click and drag the score panel or the speedometer to move it.
 -- Right-click a panel to put it back in its default spot. Positions are
 -- remembered between sessions.
@@ -100,19 +87,6 @@ local CFG = {
   SPEEDO_FALLBACK_RPM = 8000, -- used if the car does not report a limiter rpm
   -- HUD
   HUD_DRAG           = true,  -- false: panels cannot be moved (they stay at their default spots)
-
-  -- COMMUTE MODE
-  COMMUTE_FIRST_SLOT      = 41,    -- entry list slot (CAR_41) where the commute cars start
-  COMMUTE_GOAL_MILES      = 15,    -- distance to cover
-  COMMUTE_TIME_S          = 900,   -- 15:00 on the clock; it keeps counting into the negatives
-  COMMUTE_SPEED_LIMIT_MPH = 80,    -- the speed limit for the whole road
-  COMMUTE_OVER_MPH        = 10,    -- allowed over the limit near police (80 + 10 = 90 mph max)
-  COMMUTE_POLICE_RADIUS   = 50,    -- metres: how close a police car counts as "near"
-  COMMUTE_START_SPEED_KMH = 5,     -- the clock starts once you are moving at least this fast (outside the pits)
-  -- Police cars are matched by a keyword in the car folder name
-  -- (nypd_charger, nypd_ford, tgn_smart_nypd_cruiser, tga_ford_explorer_interceptor)
-  COMMUTE_POLICE_MODELS   = { "police", "nypd", "interceptor" },
-  DEBUG_FORCE_COMMUTE     = false, -- true: commute mode for ANY car (for testing). Turn off afterwards.
 }
 
 ---------------------------------------------------------------------
@@ -122,9 +96,6 @@ local storage = ac.storage{ bestScore = 0 }
 
 -- remembered speedometer unit (starts from CFG.SPEEDO_USE_MPH the first time)
 local prefs = ac.storage{ useMph = CFG.SPEEDO_USE_MPH }
-
--- best commute time (seconds, 0 = none yet)
-local cstorage = ac.storage{ commuteBest = 0 }
 
 local S = {
   phase = 'idle',        -- 'idle' (waiting for first pass), 'running', 'finished'
@@ -150,27 +121,6 @@ local S = {
   group = nil,           -- current squeeze group: { n, sumPts, sumProx, paid, lastT }
   prevForward = {},      -- [carIndex] = last forward distance
 }
-
--- commute mode state
-local C = {
-  phase = 'idle',        -- 'idle', 'running', 'finished'
-  armed = true,          -- the clock only starts when armed (re-armed by visiting the pits)
-  elapsed = 0,           -- seconds since the run started
-  timeLeft = CFG.COMMUTE_TIME_S, -- counts down, goes negative when you run over
-  distance = 0,          -- metres covered
-  finishTimer = 0,
-  success = false,       -- did the last run reach the goal?
-  endReason = '',
-  newBest = false,
-  policeDist = nil,      -- distance (m) to the nearest police car inside the radius, or nil
-  overLimit = false,     -- currently above the police speed limit
-}
-
--- which mode the local player is in. nil until the first frame decides.
-local commuteMode = nil
-
-local MILE_M = 1609.344
-local MPH_TO_KMH = 1.609344
 
 ---------------------------------------------------------------------
 -- HELPERS
@@ -202,16 +152,6 @@ local function startRound()
   S.cleanPct, S.cleanPts, S.cleanCrashes, S.cleanFlat = 0, 0, 0, 0
   S.speedSum, S.runTime, S.avgMph = 0, 0, 0
   S.group = nil
-end
-
--- wipes the overtake run (used when the player switches into commute mode)
-local function resetOvertake()
-  S.phase = 'idle'
-  S.timeLeft = CFG.ROUND_TIME_S
-  S.score, S.combo, S.mult, S.comboTimer = 0, 0, 1.0, 0
-  S.crashes, S.crashCooldown = 0, 0
-  S.group = nil
-  S.prevForward = {}
 end
 
 local function jsonStr(s)
@@ -349,176 +289,14 @@ local function cleanText()
 end
 
 ---------------------------------------------------------------------
--- COMMUTE HELPERS
----------------------------------------------------------------------
--- countdown clock: 12:34, 0:00, -0:01, -5:00 (negative once you are over time)
-local function fmtClock(t)
-  local s = math.ceil(math.abs(t))
-  local txt = string.format('%d:%02d', math.floor(s / 60), s % 60)
-  if t < 0 then txt = '-' .. txt end
-  return txt
-end
-
--- precise time for the result screen: 12:46.3
-local function fmtPrecise(t)
-  t = math.max(0, t)
-  local m = math.floor(t / 60)
-  return string.format('%d:%04.1f', m, t - m * 60)
-end
-
-local function bestCommuteText()
-  if cstorage.commuteBest > 0 then return fmtPrecise(cstorage.commuteBest) end
-  return '--:--'
-end
-
-local function isPoliceId(id)
-  id = tostring(id or ''):lower()
-  for _, m in ipairs(CFG.COMMUTE_POLICE_MODELS) do
-    if id:find(m, 1, true) then return true end
-  end
-  return false
-end
-
--- the speed (km/h) above which being near a police car ends the run
-local function commuteLimitKmh()
-  return (CFG.COMMUTE_SPEED_LIMIT_MPH + CFG.COMMUTE_OVER_MPH) * MPH_TO_KMH
-end
-
--- commute mode applies to entry list slot 41 and up, except police cars
-local function isCommuteCar(player)
-  if CFG.DEBUG_FORCE_COMMUTE then return true end
-  local slot = player.sessionID
-  if slot == nil or slot < CFG.COMMUTE_FIRST_SLOT then return false end
-  return not isPoliceId(ac.getCarID(0))
-end
-
-local function commuteReset(armed)
-  C.phase = 'idle'
-  C.armed = armed
-  C.elapsed = 0
-  C.timeLeft = CFG.COMMUTE_TIME_S
-  C.distance = 0
-  C.policeDist = nil
-  C.overLimit = false
-  C.newBest = false
-end
-
-local function commuteEnd(success, reason)
-  C.phase = 'finished'
-  C.success = success
-  C.endReason = reason
-  C.finishTimer = CFG.RESULT_SHOW_S
-  C.policeDist = nil
-  C.newBest = false
-  if success and (cstorage.commuteBest <= 0 or C.elapsed < cstorage.commuteBest) then
-    cstorage.commuteBest = C.elapsed
-    C.newBest = true
-  end
-end
-
----------------------------------------------------------------------
 -- UPDATE
 ---------------------------------------------------------------------
-local cWasColliding = false
-local cLastPos = nil
-
-local function commuteUpdate(dt, player)
-  -- crash edge (a new contact this frame)
-  local colliding = (player.collisionDepth or 0) > 0
-  local crashed = colliding and not cWasColliding
-  cWasColliding = colliding
-
-  -- distance moved since last frame (ignored if it was a teleport)
-  local inPit = player.isInPit or player.isInPitlane
-  local teleported = cLastPos ~= nil and player.position:distance(cLastPos) > CFG.TELEPORT_DIST
-  local step = 0
-  if cLastPos and not teleported then step = player.position:distance(cLastPos) end
-  cLastPos = player.position:clone()
-
-  -- visiting the pits (or teleporting) cancels a run and re-arms the clock
-  if inPit or teleported then
-    C.armed = true
-    if C.phase == 'running' then commuteReset(true) end
-  end
-
-  -- result screen
-  if C.phase == 'finished' then
-    C.finishTimer = C.finishTimer - dt
-    if C.finishTimer <= 0 then commuteReset(false) end
-    return
-  end
-
-  -- waiting: the clock starts when you drive off, outside the pit lane
-  if C.phase == 'idle' then
-    if C.armed and not inPit and player.speedKmh >= CFG.COMMUTE_START_SPEED_KMH then
-      C.phase = 'running'
-      C.elapsed, C.distance, C.timeLeft = 0, 0, CFG.COMMUTE_TIME_S
-      step = 0
-    else
-      return
-    end
-  end
-
-  -- running
-  C.elapsed = C.elapsed + dt
-  C.timeLeft = CFG.COMMUTE_TIME_S - C.elapsed      -- goes negative, never ends the run
-  C.distance = C.distance + step
-
-  if C.distance >= CFG.COMMUTE_GOAL_MILES * MILE_M then
-    commuteEnd(true, 'ARRIVED')
-    return
-  end
-
-  -- nearest police car inside the radius (cheap distance test first, then the name)
-  local nearest = nil
-  local count = ac.getSim().carsCount
-  for i = 1, count - 1 do
-    local other = ac.getCar(i)
-    if other and other.isConnected then
-      local d = other.position:distance(player.position)
-      if d <= CFG.COMMUTE_POLICE_RADIUS and (nearest == nil or d < nearest)
-         and isPoliceId(ac.getCarID(i)) then
-        nearest = d
-      end
-    end
-  end
-  C.policeDist = nearest
-  C.overLimit = player.speedKmh > commuteLimitKmh()
-
-  if nearest then
-    if C.overLimit then
-      commuteEnd(false, 'SPEEDING NEAR POLICE')
-      return
-    end
-    if crashed then
-      commuteEnd(false, 'CRASHED NEAR POLICE')
-      return
-    end
-  end
-end
-
 local wasColliding = false
 local lastPos = nil
 
 function script.update(dt)
   local player = ac.getCar(0)
   if not player then return end
-
-  -- pick the game mode from the car you are driving (re-checked every frame)
-  local wantCommute = isCommuteCar(player)
-  if wantCommute ~= commuteMode then
-    commuteMode = wantCommute
-    ac.log(string.format('game mode: %s (slot %s, car %s)',
-      commuteMode and 'COMMUTE' or 'OVERTAKE', tostring(player.sessionID), tostring(ac.getCarID(0))))
-    resetOvertake()
-    commuteReset(true)
-    lastPos, wasColliding = nil, false
-    cLastPos, cWasColliding = nil, false
-  end
-  if commuteMode then
-    commuteUpdate(dt, player)
-    return
-  end
 
   S.popupTimer = math.max(0, S.popupTimer - dt)
   S.clock = S.clock + dt
@@ -664,13 +442,7 @@ local function speedoPanelSize()
   return 340 * k, 176 * k
 end
 
--- height of the top panel (the overtake score panel or the commute panel)
 local function scorePanelH()
-  if commuteMode then
-    if C.phase == 'running' then return 130 end
-    if C.phase == 'finished' then return 176 end
-    return 100
-  end
   if S.phase == 'running' then return 126 end
   if S.phase == 'finished' then return 176 end
   return 100
@@ -904,150 +676,6 @@ local function drawScoreHud()
 end
 
 ---------------------------------------------------------------------
--- COMMUTE HUD (same window / position as the score panel)
----------------------------------------------------------------------
-local function drawCommuteHud()
-  local W = SCORE_W
-  local pos = getPos('score')
-  local useMph = prefs.useMph
-  local goal = CFG.COMMUTE_GOAL_MILES * MILE_M
-  local distUnit = useMph and MILE_M or 1000
-  local distLabel = useMph and 'MI' or 'KM'
-
-  ui.transparentWindow('nohesiScore', pos, winSizeOf('score'), function()
-    ui.pushDWriteFont('Segoe UI;Weight=Bold')
-
-    local o = ui.getCursor() + vec2(MARGIN, 0)
-    local left, right, cx = 30, W - 30, W / 2
-    local panelH = scorePanelH()
-
-    -- accent colour: amber near police, red when over time, green otherwise
-    local ar, ag, ab = 0.55, 0.85, 1.0
-    if C.phase == 'running' then
-      if C.policeDist then ar, ag, ab = 1.0, 0.6, 0.15
-      elseif C.timeLeft < 0 then ar, ag, ab = 1.0, 0.35, 0.3
-      else ar, ag, ab = 0.4, 1.0, 0.5 end
-    elseif C.phase == 'finished' then
-      if C.success then ar, ag, ab = 0.4, 1.0, 0.5
-      else ar, ag, ab = 1.0, 0.35, 0.3 end
-    end
-    local accent = rgbm(ar, ag, ab, 1)
-
-    -- panel
-    ui.drawRectFilled(o + vec2(10, 0), o + vec2(W - 10, panelH),
-      rgbm(0.04, 0.05, 0.08, 0.78), 14, ui.CornerFlags.All)
-    ui.drawRect(o + vec2(10, 0), o + vec2(W - 10, panelH),
-      rgbm(ar, ag, ab, 0.85), 14, ui.CornerFlags.All, 2)
-
-    if dragging and dragging.key == 'score' then
-      ui.drawRect(o + vec2(6, -4), o + vec2(W - 6, panelH + 4),
-        rgbm(1, 1, 1, 0.55), 16, ui.CornerFlags.All, 1)
-    end
-
-    if C.phase == 'idle' then
-      if C.armed then
-        textCenter('DRIVE OFF TO START', 26, o.x + cx, o.y + 20, WHITE)
-      else
-        textCenter('RETURN TO PITS TO RE-ARM', 20, o.x + cx, o.y + 24, WHITE)
-      end
-      textCenter(string.format('COMMUTE  %d MILES IN %s     BEST %s',
-        CFG.COMMUTE_GOAL_MILES, fmtClock(CFG.COMMUTE_TIME_S), bestCommuteText()),
-        16, o.x + cx, o.y + 62, GREY)
-
-    elseif C.phase == 'running' then
-      local late = C.timeLeft < 0
-      local timeCol = WHITE
-      if late then timeCol = rgbm(1, 0.4, 0.3, 1)
-      elseif C.timeLeft < 60 then timeCol = rgbm(1, 0.8, 0.3, 1) end
-
-      -- left: countdown clock (goes negative when you are over time)
-      ui.dwriteDrawText('TIME LEFT', 12, o + vec2(left, 9), GREY)
-      ui.dwriteDrawText(fmtClock(C.timeLeft), 30, o + vec2(left, 23), timeCol)
-
-      -- centre: distance covered
-      textCenter('DISTANCE', 12, o.x + cx, o.y + 9, GREY)
-      textCenter(string.format('%.1f / %.1f %s', C.distance / distUnit, goal / distUnit, distLabel),
-        22, o.x + cx, o.y + 26, WHITE)
-
-      -- right: best time
-      textRight('BEST', 12, o.x + right, o.y + 9, GREY)
-      textRight(bestCommuteText(), 22, o.x + right, o.y + 26, WHITE)
-
-      -- progress bar with a white tick showing where you should be to make it on time
-      local frac = math.saturate(C.distance / goal)
-      local paceFrac = math.saturate(C.elapsed / CFG.COMMUTE_TIME_S)
-      local barL, barR, barY, barH = o.x + left, o.x + right, o.y + 68, 18
-      local barW = barR - barL
-      local br, bg, bb
-      if late then br, bg, bb = 1.0, 0.35, 0.3
-      elseif frac >= paceFrac then br, bg, bb = 0.4, 1.0, 0.5
-      else br, bg, bb = 1.0, 0.8, 0.3 end
-
-      ui.drawRectFilled(vec2(barL, barY), vec2(barR, barY + barH),
-        rgbm(1, 1, 1, 0.12), 4, ui.CornerFlags.All)
-      if frac > 0.002 then
-        ui.drawRectFilled(vec2(barL, barY), vec2(barL + barW * frac, barY + barH),
-          rgbm(br, bg, bb, 0.95), 4, ui.CornerFlags.All)
-      end
-      local tickX = barL + barW * paceFrac
-      ui.drawRectFilled(vec2(tickX - 1.5, barY - 4), vec2(tickX + 1.5, barY + barH + 4),
-        rgbm(1, 1, 1, 0.9), 1, ui.CornerFlags.All)
-      textCenter(string.format('%d%%', math.floor(frac * 100)), 14, o.x + cx, o.y + 68, rgbm(0, 0, 0, 0.85))
-
-      -- bottom row: pace needed (left), police status (right)
-      local remain = math.max(0, goal - C.distance)
-      local paceTxt
-      if C.timeLeft > 1 then
-        local v = (remain / C.timeLeft) * (useMph and 2.236936 or 3.6)
-        paceTxt = string.format('NEED %d %s AVG', math.floor(v + 0.5), useMph and 'MPH' or 'KM/H')
-      else
-        paceTxt = 'OVER TIME'
-      end
-      ui.dwriteDrawText(paceTxt, 16, o + vec2(left, 98), late and rgbm(1, 0.4, 0.3, 1) or GREY)
-
-      if C.policeDist then
-        local limDisp = useMph and (CFG.COMMUTE_SPEED_LIMIT_MPH + CFG.COMMUTE_OVER_MPH)
-          or math.floor(commuteLimitKmh() + 0.5)
-        textRight('COPS NEAR - STAY UNDER ' .. limDisp, 16, o.x + right, o.y + 98,
-          rgbm(1, 0.6, 0.15, 1))
-      else
-        textRight('ROAD CLEAR', 16, o.x + right, o.y + 98, GREY)
-      end
-
-    else -- finished
-      local toGo = math.max(0, goal - C.distance)
-      textCenter(C.success and 'ARRIVED' or 'BUSTED', 22, o.x + cx, o.y + 8, accent)
-
-      if C.success then
-        textCenter('YOUR TIME', 12, o.x + cx, o.y + 36, GREY)
-        textCenter(fmtPrecise(C.elapsed), 44, o.x + cx, o.y + 48, WHITE)
-        if C.timeLeft >= 0 then
-          textCenter(fmtPrecise(C.timeLeft) .. ' SPARE', 16, o.x + cx, o.y + 106,
-            rgbm(0.4, 1, 0.5, 1))
-        else
-          textCenter('LATE BY ' .. fmtPrecise(-C.timeLeft), 16, o.x + cx, o.y + 106,
-            rgbm(1, 0.8, 0.3, 1))
-        end
-      else
-        textCenter(C.endReason, 14, o.x + cx, o.y + 36, GREY)
-        textCenter(string.format('%.1f %s', C.distance / distUnit, distLabel),
-          44, o.x + cx, o.y + 48, WHITE)
-        textCenter(string.format('%.1f %s SHORT OF WORK', toGo / distUnit, distLabel),
-          16, o.x + cx, o.y + 106, GREY)
-      end
-
-      if C.newBest then
-        textCenter('NEW PERSONAL BEST!', 17, o.x + cx, o.y + 150, rgbm(0.4, 1, 0.5, 1))
-      else
-        textCenter('BEST ' .. bestCommuteText(), 17, o.x + cx, o.y + 150, GREY)
-      end
-    end
-
-    ui.popDWriteFont()
-  end)
-end
-
----------------------------------------------------------------------
 -- SPEEDOMETER
 ---------------------------------------------------------------------
 local function drawSpeedo()
@@ -1133,38 +761,21 @@ local function drawSpeedo()
         col, 2 * k, ui.CornerFlags.All)
     end
 
-    -- bottom indicator + bar.
-    --   overtake mode: SPEED MULT (what every pass is multiplied by right now)
-    --   commute mode:  POLICE LIMIT (the speed you must stay under near police)
+    -- SPEED MULTIPLIER indicator (what every pass is multiplied by right now)
     do
-      local label, valueText, t, mcol
-      if commuteMode then
-        local limitKmh = commuteLimitKmh()
-        local over = player.speedKmh > limitKmh
-        t = math.saturate(player.speedKmh / limitKmh)
-        if over then mcol = rgbm(1, 0.3, 0.25, 1)
-        elseif t > 0.9 then mcol = rgbm(1, 0.6, 0.15, 1)
-        elseif t > 0.75 then mcol = rgbm(1, 0.85, 0.2, 1)
-        else mcol = rgbm(0.55, 0.85, 1, 1) end
-        local limDisp = useMph and (CFG.COMMUTE_SPEED_LIMIT_MPH + CFG.COMMUTE_OVER_MPH)
-          or math.floor(limitKmh + 0.5)
-        label = 'POLICE LIMIT'
-        valueText = limDisp .. (useMph and ' MPH' or ' KM/H')
-      else
-        local sm = speedMultiplier(player.speedKmh)
-        t = math.saturate((sm - CFG.SPEED_MULT_MIN) / math.max(0.01, CFG.SPEED_MULT_MAX - CFG.SPEED_MULT_MIN))
-        if t >= 0.999 then mcol = rgbm(1, 0.3, 0.25, 1)          -- maxed out
-        elseif t > 0.66 then mcol = rgbm(1, 0.6, 0.15, 1)
-        elseif t > 0.33 then mcol = rgbm(1, 0.85, 0.2, 1)
-        else mcol = rgbm(0.55, 0.85, 1, 1) end
-        label = 'SPEED MULT'
-        valueText = string.format('x%.2f', sm) .. (t >= 0.999 and ' MAX' or '')
-      end
+      local sm = speedMultiplier(player.speedKmh)
+      local t = math.saturate((sm - CFG.SPEED_MULT_MIN) / math.max(0.01, CFG.SPEED_MULT_MAX - CFG.SPEED_MULT_MIN))
+      local mcol
+      if t >= 0.999 then mcol = rgbm(1, 0.3, 0.25, 1)          -- maxed out
+      elseif t > 0.66 then mcol = rgbm(1, 0.6, 0.15, 1)
+      elseif t > 0.33 then mcol = rgbm(1, 0.85, 0.2, 1)
+      else mcol = rgbm(0.55, 0.85, 1, 1) end
 
-      ui.dwriteDrawText(label, 12 * k, o.x + 30 * k, o.y + 124 * k, GREY)
-      textRight(valueText, 26 * k, o.x + W - 30 * k, o.y + 118 * k, mcol)
+      ui.dwriteDrawText('SPEED MULT', 12 * k, o.x + 30 * k, o.y + 124 * k, GREY)
+      textRight(string.format('x%.2f', sm) .. (t >= 0.999 and ' MAX' or ''),
+        26 * k, o.x + W - 30 * k, o.y + 118 * k, mcol)
 
-      -- continuous bar, filled according to speed
+      -- continuous bar, filled according to speed (0 -> 300 km/h)
       local mx, mw, my = o.x + 30 * k, W - 60 * k, o.y + 152 * k
       ui.drawRectFilled(vec2(mx, my), vec2(mx + mw, my + 10 * k),
         rgbm(1, 1, 1, 0.12), 3 * k, ui.CornerFlags.All)
@@ -1191,6 +802,6 @@ function script.drawUI()
       dragging = nil
     end
   end
-  if commuteMode then drawCommuteHud() else drawScoreHud() end
+  drawScoreHud()
   if CFG.SHOW_SPEEDO then drawSpeedo() end
 end
