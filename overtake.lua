@@ -1,16 +1,20 @@
 -- No Hesi style overtake scorer for AssettoServer (CSP online script)
--- 3 minute rounds. Slowing down does not end anything. The combo only
--- resets after COMBO_TIMEOUT_S with no pass, or on a crash.
+-- 3 minute rounds. Slowing down does not end anything. Scoring follows the
+-- open-source No Hesi point system: the combo bleeds off over time instead
+-- of dropping to zero, and a crash wipes it.
 --
 -- Scoring per pass:
---   (base + speed bonus) x PROXIMITY multiplier x SPEED multiplier
---     PROXIMITY: closer = bigger, up to PROX_MULT_MAX
---     SPEED:     x1.1 at 0 km/h, rising evenly to x4.0 at 300 km/h (186.4 mph).
---                The current value is shown live on the speedometer.
---   + SQUEEZE bonus when several cars are passed within SQUEEZE_WINDOW_S
+--   (base + speed bonus + SQUEEZE bonus) x MULTIPLIER
+--   MULTIPLIER = (SPEED mult + PROXIMITY mult + COMBO mult) / 3, never below x1
+--     SPEED:     stepped tiers (SPEED_TIERS). The current value is shown live
+--                on the speedometer.
+--     PROXIMITY: closer = bigger (PROX_TIERS), taken from your last pass.
+--     COMBO:     +1 for every car passed, -1 every COMBO_DECAY_S with no pass.
+--   SQUEEZE bonus when several cars are passed within SQUEEZE_WINDOW_S
 --     of each other (e.g. threading between two cars). The squeeze bonus
 --     grows with the number of cars and how close you were to all of them.
---   all of that is then multiplied by the combo multiplier.
+--   (SPEED_MULT_MODE / PROX_MULT_MODE = 'smooth' switches back to the old
+--   smooth ramps.)
 --
 -- When the run ends, a CLEAN RUN bonus is added to the final score:
 --   no crashes: +50,000 flat, then +50%; 1 crash: +25,000 flat, then +25%;
@@ -50,32 +54,47 @@
 local CFG = {
   ROUND_TIME_S       = 180,   -- round length (3:00)
   RESULT_SHOW_S      = 8,     -- how long the final score screen shows
-  COMBO_TIMEOUT_S    = 10,    -- combo resets if no pass within this time
+  COMBO_DECAY_S      = 3,     -- the combo loses one level every time this long passes with no pass
+  COMBO_MAX          = 25,    -- most combo levels you can stack (combo multiplier = 1 + levels)
   MAX_PASS_DIST      = 25.0,  -- max total distance (m) for a pass to count
   MAX_LATERAL        = 4.0,   -- max sideways offset (m) for a pass to count
   MIN_PASS_SPEED_KMH = 40,    -- you must be at least this fast for a pass to count
-  BASE_POINTS        = 100,   -- points per pass (before multipliers)
+  BASE_POINTS        = 100,   -- points per pass (before the multiplier)
   SPEED_BONUS_PER_10 = 5,     -- extra points per 10 km/h above SPEED_BONUS_FROM
   SPEED_BONUS_FROM   = 80,
-  -- Speed multiplier (applied to every pass)
+
+  -- Speed multiplier (one third of the pass multiplier)
+  SPEED_MULT_MODE    = 'tiers',  -- 'tiers' = No Hesi style steps, 'smooth' = straight ramp
+  -- { minimum km/h, multiplier } - the highest tier you reach applies.
+  -- These are the open-source script's m/s values converted: 22, 40, 50 and 70 m/s
+  -- = 49, 89, 112 and 157 mph. The top tier is its x69 "cheater" tier - lower it
+  -- if your cars cruise that fast.
+  SPEED_TIERS        = { { 79, 2.5 }, { 144, 5.0 }, { 180, 10.0 }, { 252, 69.0 } },
+  -- smooth mode only:
   SPEED_MULT_MIN     = 1.1,   -- multiplier at 0 km/h
   SPEED_MULT_MAX     = 4.0,   -- multiplier at SPEED_MULT_FULL_KMH and above
   SPEED_MULT_FULL_KMH = 300,  -- speed (km/h) that earns the max speed multiplier (300 km/h = 186.4 mph)
+
   -- Proximity multiplier (sideways distance between car centres, in metres)
+  PROX_MULT_MODE     = 'tiers',  -- 'tiers' = No Hesi style steps, 'smooth' = straight ramp
+  -- { max sideways distance (m), multiplier } - keep these in ascending order
+  PROX_TIERS         = { { 2.2, 7.5 }, { 2.8, 3.5 }, { 3.4, 1.5 } },
+  -- the squeeze bonus always uses the smooth closeness below; smooth mode uses all three
   PROX_NEAR_LATERAL  = 2.0,   -- at or below this you get the full PROX_MULT_MAX
   PROX_FAR_LATERAL   = 4.0,   -- at or above this the multiplier is x1.0
-  PROX_MULT_MAX      = 3.0,   -- points multiplier for a paint-trading pass
-  PROX_POPUP_FROM    = 1.5,   -- show "CLOSE PASS" when the proximity mult reaches this
+  PROX_MULT_MAX      = 3.0,   -- smooth mode: multiplier for a paint-trading pass
+  PROX_POPUP_FROM    = 2.0,   -- show "CLOSE PASS" when the proximity mult reaches this
+
   -- Squeeze bonus (passing several cars within a short time of each other)
   SQUEEZE_WINDOW_S   = 0.3,   -- each extra pass must come within this time of the previous one
   SQUEEZE_BONUS_SCALE = 1.5,  -- scales the whole squeeze bonus (1.0 = original, 1.5 = +50%)
   SQUEEZE_BASE       = 0.5,   -- bonus multiplier added per extra car, even if they were far apart
   SQUEEZE_PROX       = 1.0,   -- extra per extra car at full proximity (scaled by average closeness)
   SQUEEZE_MAX_CARS   = 5,     -- cars beyond this stop adding to the squeeze multiplier
-  MULT_STEP          = 0.25,  -- combo multiplier added per consecutive pass
-  MULT_MAX           = 10.0,
+  MULT_COLOR_FULL    = 10.0,  -- total multiplier at which the score panel colour is fully red
   MAX_CRASHES        = 2,     -- the run ends on this crash (1st crash only resets the combo)
   CRASH_COOLDOWN_S   = 2.0,   -- ignore further contact this long after a crash (one scrape = one crash)
+  CRASH_FLASH_S      = 1.5,   -- how long the score panel flashes red after a crash
   CRASH_SCORE_LOSS   = 0.0,   -- fraction of round score lost on a non-final crash (0 = none, 0.5 = half)
   -- Clean run bonus: fraction of your final score added, by number of crashes in the run.
   -- Crash counts that are not listed (and runs that end by crashing out) get no bonus.
@@ -131,9 +150,13 @@ local S = {
   timeLeft = CFG.ROUND_TIME_S,
   finishTimer = 0,
   score = 0,
-  combo = 0,
-  mult = 1.0,
-  comboTimer = 0,
+  combo = 0,             -- combo levels stacked (combo multiplier = 1 + combo)
+  mult = 1.0,            -- total multiplier: (speed + proximity + combo) / 3
+  speedMult = 1.0,       -- speed part of the multiplier (live)
+  proxMult = 1.0,        -- proximity part of the multiplier (from your last pass)
+  comboTimer = 0,        -- counts down to the next combo level being lost
+  passes = 0,            -- cars passed this round
+  crashFlash = 0,        -- red panel flash after a crash
   popup = '', popupTimer = 0, popupGood = true,
   newBest = false,
   crashes = 0,
@@ -191,12 +214,14 @@ end
 local function resetCombo(reason)
   if S.combo > 0 then showPopup(reason, false) end
   S.combo, S.mult, S.comboTimer = 0, 1.0, 0
+  S.proxMult = 1.0
 end
 
 local function startRound()
   S.phase = 'running'
   S.timeLeft = CFG.ROUND_TIME_S
   S.score, S.combo, S.mult, S.comboTimer = 0, 0, 1.0, 0
+  S.speedMult, S.proxMult, S.passes, S.crashFlash = 1.0, 1.0, 0, 0
   S.newBest = false
   S.crashes, S.crashCooldown = 0, 0
   S.cleanPct, S.cleanPts, S.cleanCrashes, S.cleanFlat = 0, 0, 0, 0
@@ -209,6 +234,7 @@ local function resetOvertake()
   S.phase = 'idle'
   S.timeLeft = CFG.ROUND_TIME_S
   S.score, S.combo, S.mult, S.comboTimer = 0, 0, 1.0, 0
+  S.speedMult, S.proxMult, S.passes, S.crashFlash = 1.0, 1.0, 0, 0
   S.crashes, S.crashCooldown = 0, 0
   S.group = nil
   S.prevForward = {}
@@ -276,26 +302,56 @@ local function proximityFactor(lateral)
   return math.saturate((CFG.PROX_FAR_LATERAL - lateral) / span)
 end
 
--- x1.1 at 0 km/h, rising in a straight line to x4.0 at 300 km/h (186.4 mph)
+-- Speed part of the multiplier. Returns the multiplier, how full the speedometer
+-- bar should be (0..1) and how high up the tiers you are (0..1, for colouring).
 local function speedMultiplier(speedKmh)
-  local t = math.saturate(speedKmh / math.max(1, CFG.SPEED_MULT_FULL_KMH))
-  return CFG.SPEED_MULT_MIN + (CFG.SPEED_MULT_MAX - CFG.SPEED_MULT_MIN) * t
+  if CFG.SPEED_MULT_MODE == 'smooth' then
+    local t = math.saturate(speedKmh / math.max(1, CFG.SPEED_MULT_FULL_KMH))
+    return CFG.SPEED_MULT_MIN + (CFG.SPEED_MULT_MAX - CFG.SPEED_MULT_MIN) * t, t, t
+  end
+  local tiers = CFG.SPEED_TIERS
+  local m, idx = 1.0, 0
+  for i, tier in ipairs(tiers) do
+    if speedKmh >= tier[1] then m, idx = tier[2], i else break end
+  end
+  local top = math.max(1, tiers[#tiers][1])
+  return m, math.saturate(speedKmh / top), idx / #tiers
+end
+
+-- Proximity part of the multiplier, from the sideways distance of a pass
+local function proximityMultiplier(lateral)
+  if CFG.PROX_MULT_MODE == 'smooth' then
+    return 1.0 + (CFG.PROX_MULT_MAX - 1.0) * proximityFactor(lateral)
+  end
+  for _, tier in ipairs(CFG.PROX_TIERS) do
+    if lateral <= tier[1] then return tier[2] end
+  end
+  return 1.0
+end
+
+-- total multiplier: the three parts averaged (never below x1), No Hesi style
+local function refreshMult(speedKmh)
+  S.speedMult = speedMultiplier(speedKmh)
+  S.mult = math.max(1.0, (S.speedMult + S.proxMult + (1 + S.combo)) / 3)
 end
 
 local function registerPass(speed, lateral)
   if S.phase == 'idle' then startRound() end
 
-  S.combo = S.combo + 1
-  S.mult = math.min(CFG.MULT_MAX, 1.0 + (S.combo - 1) * CFG.MULT_STEP)
-  S.comboTimer = CFG.COMBO_TIMEOUT_S
+  -- the combo stacks one level per car and bleeds off in script.update
+  S.combo = math.min(CFG.COMBO_MAX, S.combo + 1)
+  S.comboTimer = CFG.COMBO_DECAY_S
+  S.passes = S.passes + 1
 
-  -- base points + speed bonus, scaled by how close the pass was and how fast you were going
-  local base = CFG.BASE_POINTS
-    + math.max(0, (speed - CFG.SPEED_BONUS_FROM) / 10) * CFG.SPEED_BONUS_PER_10
+  -- proximity comes from this pass, speed from right now; refreshMult averages
+  -- them with the combo into the multiplier this pass is paid at
   local prox = proximityFactor(lateral)
-  local proxMult = 1.0 + (CFG.PROX_MULT_MAX - 1.0) * prox
-  local speedMult = speedMultiplier(speed)
-  local passPts = base * proxMult * speedMult
+  S.proxMult = proximityMultiplier(lateral)
+  refreshMult(speed)
+
+  -- base points + speed bonus; the multiplier is applied to the total below
+  local passPts = CFG.BASE_POINTS
+    + math.max(0, (speed - CFG.SPEED_BONUS_FROM) / 10) * CFG.SPEED_BONUS_PER_10
 
   -- squeeze group: passes that follow each other within SQUEEZE_WINDOW_S
   local g = S.group
@@ -324,7 +380,7 @@ local function registerPass(speed, lateral)
 
   if g.n >= 2 then
     showPopup(string.format('SQUEEZE x%d  +%d', g.n, math.floor(gained)), true)
-  elseif proxMult >= CFG.PROX_POPUP_FROM then
+  elseif S.proxMult >= CFG.PROX_POPUP_FROM then
     showPopup('CLOSE PASS  +' .. math.floor(gained), true)
   else
     showPopup('+' .. math.floor(gained), true)
@@ -521,6 +577,7 @@ function script.update(dt)
   end
 
   S.popupTimer = math.max(0, S.popupTimer - dt)
+  S.crashFlash = math.max(0, S.crashFlash - dt)
   S.clock = S.clock + dt
 
   -- running average speed (time-weighted) for the leaderboard / result screen
@@ -567,6 +624,7 @@ function script.update(dt)
   if colliding and not wasColliding and S.phase == 'running' and S.crashCooldown <= 0 then
     S.crashes = S.crashes + 1
     S.crashCooldown = CFG.CRASH_COOLDOWN_S
+    S.crashFlash = CFG.CRASH_FLASH_S
     if S.crashes >= CFG.MAX_CRASHES then
       endRound('CRASHED OUT')
     else
@@ -579,11 +637,18 @@ function script.update(dt)
   end
   wasColliding = colliding
 
-  -- combo timeout (no passes for COMBO_TIMEOUT_S)
+  -- combo decay: lose one level every COMBO_DECAY_S without a pass
   if S.phase == 'running' and S.combo > 0 then
     S.comboTimer = S.comboTimer - dt
-    if S.comboTimer <= 0 then resetCombo('COMBO LOST') end
+    if S.comboTimer <= 0 then
+      S.combo = S.combo - 1
+      S.comboTimer = CFG.COMBO_DECAY_S
+      if S.combo == 0 then S.proxMult = 1.0 end
+    end
   end
+
+  -- keep the live multiplier up to date (shown on the score panel)
+  if S.phase == 'running' then refreshMult(player.speedKmh) end
 
   -- pass detection
   local speed = player.speedKmh
@@ -619,7 +684,7 @@ local function lerp(a, b, t) return a + (b - a) * t end
 
 -- multiplier colour: ice blue -> yellow -> red as the multiplier climbs
 local function multRGB(m)
-  local t = math.saturate((m - 1) / (CFG.MULT_MAX - 1))
+  local t = math.saturate((m - 1) / (CFG.MULT_COLOR_FULL - 1))
   if t < 0.5 then
     local k = t / 0.5
     return lerp(0.55, 1.0, k), lerp(0.85, 0.85, k), lerp(1.0, 0.2, k)
@@ -641,6 +706,12 @@ end
 
 local GREY = rgbm(0.65, 0.7, 0.78, 1)
 local WHITE = rgbm(1, 1, 1, 1)
+
+-- multiplier text: x2.5, x5, x10, x69 (drops a trailing .0)
+local function fmtMult(m)
+  local s = string.format('%.1f', m)
+  return 'x' .. (s:gsub('%.0$', ''))
+end
 
 -- The window is wider than the panel (MARGIN on each side) so nothing
 -- near the edges gets clipped by the window bounds.
@@ -671,7 +742,7 @@ local function scorePanelH()
     if C.phase == 'finished' then return 176 end
     return 100
   end
-  if S.phase == 'running' then return 126 end
+  if S.phase == 'running' then return 148 end
   if S.phase == 'finished' then return 176 end
   return 100
 end
@@ -810,6 +881,8 @@ local function drawScoreHud()
     local left, right, cx = 30, W - 30, W / 2
     local ar, ag, ab = 0.55, 0.85, 1.0   -- accent colour
     local panelH = scorePanelH()
+    -- red flash on the panel fill after a crash (fades out over CRASH_FLASH_S)
+    local flash = math.saturate(S.crashFlash / math.max(0.01, CFG.CRASH_FLASH_S))
 
     if S.phase == 'running' then
       ar, ag, ab = multRGB(S.mult)
@@ -822,7 +895,7 @@ local function drawScoreHud()
 
     -- panel
     ui.drawRectFilled(o + vec2(10, 0), o + vec2(W - 10, panelH),
-      rgbm(0.04, 0.05, 0.08, 0.78), 14, ui.CornerFlags.All)
+      rgbm(0.04 + 0.5 * flash, 0.05, 0.08, 0.78), 14, ui.CornerFlags.All)
     ui.drawRect(o + vec2(10, 0), o + vec2(W - 10, panelH),
       rgbm(ar, ag, ab, 0.85), 14, ui.CornerFlags.All, 2)
 
@@ -853,18 +926,27 @@ local function drawScoreHud()
       textCenter('SCORE', 12, o.x + cx, o.y + 7, GREY)
       textCenter(tostring(math.floor(S.score)), 44, o.x + cx, o.y + 17, WHITE)
 
-      -- bottom row: combo / multiplier / crashes
-      ui.dwriteDrawText('COMBO ' .. S.combo, 16, o + vec2(left, 78), GREY)
+      -- bottom row: cars passed / total multiplier / crashes
+      ui.dwriteDrawText('PASSED ' .. S.passes, 16, o + vec2(left, 78), GREY)
       textCenter(string.format('x%.2f', S.mult), 30, o.x + cx, o.y + 70, accent)
       textRight('CRASH ' .. S.crashes .. '/' .. CFG.MAX_CRASHES, 16, o.x + right, o.y + 78,
         S.crashes > 0 and rgbm(1, 0.4, 0.35, 1) or GREY)
 
-      -- combo timer bar
-      local barL, barR, barY = o.x + left, o.x + right, o.y + 112
+      -- the three parts that get averaged into the multiplier (lit when above x1)
+      local comboMult = 1 + S.combo
+      ui.dwriteDrawText('SPEED ' .. fmtMult(S.speedMult), 14, o + vec2(left, 108),
+        S.speedMult > 1.05 and accent or GREY)
+      textCenter('PROX ' .. fmtMult(S.proxMult), 14, o.x + cx, o.y + 108,
+        S.proxMult > 1.05 and accent or GREY)
+      textRight('COMBO ' .. fmtMult(comboMult), 14, o.x + right, o.y + 108,
+        comboMult > 1.05 and accent or GREY)
+
+      -- combo timer bar (time until the combo loses a level)
+      local barL, barR, barY = o.x + left, o.x + right, o.y + 132
       ui.drawRectFilled(vec2(barL, barY), vec2(barR, barY + 6),
         rgbm(1, 1, 1, 0.12), 3, ui.CornerFlags.All)
       if S.combo > 0 then
-        local frac = math.saturate(S.comboTimer / CFG.COMBO_TIMEOUT_S)
+        local frac = math.saturate(S.comboTimer / CFG.COMBO_DECAY_S)
         if frac > 0.01 then
           ui.drawRectFilled(vec2(barL, barY), vec2(barL + (barR - barL) * frac, barY + 6),
             rgbm(ar, ag, ab, 0.95), 3, ui.CornerFlags.All)
@@ -1134,7 +1216,7 @@ local function drawSpeedo()
     end
 
     -- bottom indicator + bar.
-    --   overtake mode: SPEED MULT (what every pass is multiplied by right now)
+    --   overtake mode: SPEED MULT (the speed part of the pass multiplier right now)
     --   commute mode:  POLICE LIMIT (the speed you must stay under near police)
     do
       local label, valueText, t, mcol
@@ -1151,14 +1233,15 @@ local function drawSpeedo()
         label = 'POLICE LIMIT'
         valueText = limDisp .. (useMph and ' MPH' or ' KM/H')
       else
-        local sm = speedMultiplier(player.speedKmh)
-        t = math.saturate((sm - CFG.SPEED_MULT_MIN) / math.max(0.01, CFG.SPEED_MULT_MAX - CFG.SPEED_MULT_MIN))
-        if t >= 0.999 then mcol = rgbm(1, 0.3, 0.25, 1)          -- maxed out
-        elseif t > 0.66 then mcol = rgbm(1, 0.6, 0.15, 1)
-        elseif t > 0.33 then mcol = rgbm(1, 0.85, 0.2, 1)
+        -- sm = the multiplier, fill = how full the bar is, level = how high up the tiers you are
+        local sm, fill, level = speedMultiplier(player.speedKmh)
+        t = fill
+        if level >= 0.999 then mcol = rgbm(1, 0.3, 0.25, 1)          -- top tier
+        elseif level > 0.66 then mcol = rgbm(1, 0.6, 0.15, 1)
+        elseif level > 0.33 then mcol = rgbm(1, 0.85, 0.2, 1)
         else mcol = rgbm(0.55, 0.85, 1, 1) end
         label = 'SPEED MULT'
-        valueText = string.format('x%.2f', sm) .. (t >= 0.999 and ' MAX' or '')
+        valueText = fmtMult(sm) .. (level >= 0.999 and ' MAX' or '')
       end
 
       ui.dwriteDrawText(label, 12 * k, o.x + 30 * k, o.y + 124 * k, GREY)
