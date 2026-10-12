@@ -14,7 +14,7 @@
 --                x3.0 at 2 m or closer.
 --     COMBO:     +0.25 per pass, up to x10. How long you have to land the next
 --                pass, and what happens if you miss it, depends on the zone:
---                  up to x5         3 s to pass, or the combo is lost (back to x1)
+--                  up to x5         10 s to pass, or the combo is lost (back to x1)
 --                  x5.25 to x7.5    3 s to pass, or the combo drops by 0.5
 --                  x7.75 to x10     2 s to pass, or the combo drops to x7.5
 --                After a drop you are in the lower zone and its rules apply.
@@ -83,7 +83,7 @@ local CFG = {
   -- window = seconds you have to land the next pass, onTimeout = what happens if you don't:
   --   'reset' = combo lost (back to x1), 'drop' = lose `amount`, 'floor' = fall to `floor`
   COMBO_ZONES = {
-    { upTo = 5.0,  window = 3.0, onTimeout = 'reset' },
+    { upTo = 5.0,  window = 10.0, onTimeout = 'reset' },
     { upTo = 7.5,  window = 3.0, onTimeout = 'drop',  amount = 0.5 },
     { upTo = 10.0, window = 2.0, onTimeout = 'floor', floor = 7.5 },
   },
